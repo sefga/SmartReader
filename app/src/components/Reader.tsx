@@ -1,5 +1,6 @@
 'use client';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import Link from 'next/link';
 import Icon from './Icons';
 import Modal from './Modal';
 import Publish from './Publish';
@@ -227,7 +228,7 @@ export default function Reader() {
   }
 
   return <div className="reader-app">
-    <header className="reader-topbar"><a href="/" className="reader-brand" aria-label="SmartReader — главная"><Icon name="book" size={24}/><span>SmartReader</span></a><div className="reader-top-actions"><button className="upload-button publish-button" onClick={()=>{pause();setError('');setDialog('publish');}} aria-label="Сохранить материал"><Icon name="arrow" size={17}/><span>Сохранить</span></button><button className="upload-button" onClick={openImport} aria-label="Добавить материал"><Icon name="upload" size={17}/><span>Добавить материал</span></button><a href="/reader/sign-in/" className="reader-login">Войти</a></div></header>
+    <header className="reader-topbar"><Link href="/" className="reader-brand" aria-label="SmartReader — главная"><Icon name="book" size={24}/><span>SmartReader</span></Link><div className="reader-top-actions"><button className="upload-button publish-button" onClick={()=>{pause();setError('');setDialog('publish');}} aria-label="Сохранить материал"><Icon name="arrow" size={17}/><span>Сохранить</span></button><button className="upload-button" onClick={openImport} aria-label="Добавить материал"><Icon name="upload" size={17}/><span>Добавить материал</span></button><Link href="/reader/sign-in/" className="reader-login">Войти</Link></div></header>
     <nav className="reading-nav" aria-label="Разделы статьи"><span className="reading-percent" title="Прогресс чтения">{readPercent}%</span><div className="section-links">{headings.map(({block,index})=><a href={`#section-${index}`} key={index} className={section===index?'is-active':''} onClick={()=>setFollow(false)}>{block.text}</a>)}</div><div className="reading-line"><span style={{width:`${readPercent}%`}}/></div></nav>
     <main className="reader-main">
       <div className="article-eyebrow"><span className="live-dot"/>{audioUrl ? 'ВАША СТАТЬЯ' : 'ПОПРОБУЙТЕ ЧИТАЛКУ'}<span>ТЕКСТ + АУДИО</span></div>

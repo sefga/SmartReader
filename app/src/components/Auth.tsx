@@ -1,5 +1,6 @@
 'use client';
 import { useState } from 'react';
+import Link from 'next/link';
 import Modal from './Modal';
 import Icon from './Icons';
 
@@ -12,7 +13,7 @@ export default function Auth({ mode }: { mode: 'sign-in' | 'sign-up' }) {
   return <main id="maincontent" className="auth-main">
     <div className={`auth-card ${signup ? 'signup' : 'signin'}`}>
       <header className="auth-header">
-        <a href="/reader/" className="wordmark" aria-label="SmartReader — открыть читалку"><span className="wordmark-bars"/><strong>SmartReader</strong></a>
+        <Link href="/reader/" className="wordmark" aria-label="SmartReader — открыть читалку"><span className="wordmark-bars"/><strong>SmartReader</strong></Link>
         <div className="auth-intro">
           <h1>{signup ? 'Читайте и слушайте свои статьи.' : 'Вернитесь к чтению.'}</h1>
           {signup ? <>
@@ -35,13 +36,13 @@ export default function Auth({ mode }: { mode: 'sign-in' | 'sign-up' }) {
         <label>Email<input autoFocus required type="email" autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com"/></label>
         <button className="primary-button" type="submit">Продолжить</button>
       </form>}
-      <footer className="auth-footer"><span>{signup ? 'Уже зарегистрированы?' : 'Впервые здесь?'}</span><a href={signup ? '/reader/sign-in/' : '/reader/sign-up/'}>{signup ? 'Войти' : 'Регистрация'}</a></footer>
-      <a className="reader-entry" href="/reader/">Открыть читалку без регистрации <span aria-hidden="true">→</span></a>
-      <a className="publication-entry" href="/reader/?publish=1">Озвучка статей для вашего сайта →</a>
+      <footer className="auth-footer"><span>{signup ? 'Уже зарегистрированы?' : 'Впервые здесь?'}</span><Link href={signup ? '/reader/sign-in/' : '/reader/sign-up/'}>{signup ? 'Войти' : 'Регистрация'}</Link></footer>
+      <Link className="reader-entry" href="/reader/">Открыть читалку без регистрации <span aria-hidden="true">→</span></Link>
+      <Link className="publication-entry" href="/reader/?publish=1">Озвучка статей для вашего сайта →</Link>
     </div>
     {dialog && <Modal title={dialog} onClose={()=>setDialog('')}>
       {dialog === 'Конфиденциальность' ? <p>Текст, аудио и прогресс хранятся в вашем браузере. Файлы не отправляются на сервер. Очистка данных браузера удалит сохранённые материалы.</p> : dialog === 'Условия использования' ? <p>Загружайте материалы, которые вы вправе использовать. Эта читалка работает локально и не создаёт облачный аккаунт.</p> : <p>В этой версии доступен локальный просмотрщик. Вход через внешние сервисы ещё не подключён; можно сразу перейти к чтению и загрузить свои материалы.</p>}
-      <a href="/reader/" className="primary-button">Открыть читалку <Icon name="arrow" size={18}/></a>
+      <Link href="/reader/" className="primary-button">Открыть читалку <Icon name="arrow" size={18}/></Link>
     </Modal>}
   </main>;
 }

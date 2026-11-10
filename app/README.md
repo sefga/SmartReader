@@ -1,5 +1,7 @@
 # SmartReader
 
+Онлайн: [Netlify](https://speechread.netlify.app/reader/), [Vercel](https://speechread.vercel.app/reader/), [GitHub Pages](https://sefga.github.io/SmartReader/reader/). [Настройки развёртывания](docs/deployment.md).
+
 Локальная читалка готовой статьи с готовой озвучкой. Есть подсветка слов, перемотка нажатием на слово, оглавление, закладка и восстановление позиции.
 
 Рабочий сценарий: **вставить свою статью → загрузить аудио или записать звук выбранной вкладки Chrome/Edge → читать и слушать → скачать HTML и аудио для личного архива**.
