@@ -1,0 +1,25 @@
+# Зависимости, сборка и временные результаты
+**/node_modules/
+**/.next/
+**/out/
+**/output/
+**/.npm-cache/
+**/*.tsbuildinfo
+
+# Секреты и локальные настройки
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Локальные захваты и материалы исследования
+/capture/
+/checks/
+/inbox/
+/investigation.cany/
+/reference/
+/build-activity.log
+/craft.json
+/feed.json
+/usage.json
