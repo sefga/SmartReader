@@ -1,6 +1,6 @@
 import type { ReadingDocument } from './sync';
 export interface SavedReading { document: ReadingDocument; audio?: Blob; exact: boolean }
-// Прежнее имя базы сохраняет доступ к материалам после переименования в SmartReader.
+// Прежнее имя базы сохраняет доступ к материалам после переименования в speechread.
 const DB_NAME = 'text-and-voice';
 
 function openDatabase(): Promise<IDBDatabase> {

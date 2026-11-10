@@ -1,4 +1,4 @@
-# Публикация SmartReader / speechread
+# Публикация speechread
 
 Сайт собирается через статический экспорт Next.js. Текст, аудио и прогресс остаются в браузере посетителя. Серверная база данных и API-ключи для работы читалки не нужны.
 
@@ -6,21 +6,21 @@
 | --- | --- | --- |
 | Netlify | [speechread.netlify.app](https://speechread.netlify.app/) | `netlify.toml`: база `app`, команда `npm run build`, публикация `out` |
 | Vercel | [speechread.vercel.app](https://speechread.vercel.app/) | Проект `speechread`, Root Directory `app`, Next.js, ветка `main` |
-| GitHub Pages | [sefga.github.io/SmartReader](https://sefga.github.io/SmartReader/) | `.github/workflows/pages.yml`, источник публикации GitHub Actions |
+| GitHub Pages | [sefga.github.io/speechread](https://sefga.github.io/speechread/) | `.github/workflows/pages.yml`, источник публикации GitHub Actions |
 
 Изменения в `main` запускают публикацию на подключённых площадках. Workflow Pages устанавливает зависимости через `npm ci`, запускает тесты и собирает сайт. Дополнительные токены для Pages не нужны: используется встроенная авторизация GitHub Actions.
 
-Для GitHub Pages переменная сборки `NEXT_PUBLIC_BASE_PATH` задаёт префикс `/SmartReader`; workflow получает его из `configure-pages`. На Vercel и Netlify переменная не задаётся. Внутренние ссылки используют `next/link`, чтобы учитывать префикс. При смене префикса сайт нужно пересобрать.
+Для GitHub Pages переменная сборки `NEXT_PUBLIC_BASE_PATH` задаёт префикс `/speechread`; workflow получает его из `configure-pages`. На Vercel и Netlify переменная не задаётся. Внутренние ссылки используют `next/link`, чтобы учитывать префикс. При смене префикса сайт нужно пересобрать.
 
 ```mermaid
 flowchart TD
-    A[Публичный репозиторий sefga/SmartReader: main] --> B[Vercel: app]
+    A[Публичный репозиторий sefga/speechread: main] --> B[Vercel: app]
     A --> C[Netlify: netlify.toml]
     A --> D[GitHub Actions: тесты и сборка]
     B --> E[speechread.vercel.app]
     C --> F[speechread.netlify.app]
-    D --> G[Статический экспорт с префиксом /SmartReader]
-    G --> H[sefga.github.io/SmartReader]
+    D --> G[Статический экспорт с префиксом /speechread]
+    G --> H[sefga.github.io/speechread]
     E --> I[Читалка в браузере посетителя]
     F --> I
     H --> I
@@ -28,7 +28,7 @@ flowchart TD
     I --> K[localStorage: позиция и закладка]
 ```
 
-Канонический путь читалки — `reader/` относительно адреса сайта. Netlify и Vercel направляют `/reader/library/*` в читалку. На GitHub Pages произвольный путь библиотеки обрабатывается страницей 404 с сохранением HTTP-статуса 404; используйте `/SmartReader/reader/` для постоянной ссылки. Эти пути не предоставляют другим посетителям доступ к вашим локальным материалам.
+Канонический путь читалки — `reader/` относительно адреса сайта. Netlify и Vercel направляют `/reader/library/*` в читалку. На GitHub Pages произвольный путь библиотеки обрабатывается страницей 404 с сохранением HTTP-статуса 404; используйте `/speechread/reader/` для постоянной ссылки. Эти пути не предоставляют другим посетителям доступ к вашим локальным материалам.
 
 Хранилища трёх доменов независимы. Для переноса материала используйте исходный текст и аудиофайл либо экспорт для личного архива. Публикация приложения не загружает ваши статьи на сайт.
 

@@ -13,7 +13,7 @@ export default function Auth({ mode }: { mode: 'sign-in' | 'sign-up' }) {
   return <main id="maincontent" className="auth-main">
     <div className={`auth-card ${signup ? 'signup' : 'signin'}`}>
       <header className="auth-header">
-        <Link href="/reader/" className="wordmark" aria-label="SmartReader — открыть читалку"><span className="wordmark-bars"/><strong>SmartReader</strong></Link>
+        <Link href="/reader/" className="wordmark" aria-label="speechread — открыть читалку"><span className="wordmark-bars"/><strong>speechread</strong></Link>
         <div className="auth-intro">
           <h1>{signup ? 'Читайте и слушайте свои статьи.' : 'Вернитесь к чтению.'}</h1>
           {signup ? <>

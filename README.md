@@ -1,10 +1,10 @@
-# SmartReader
+# speechread
 
 Публичный проект. Онлайн-версия — **speechread**:
 
 - **[speechread.netlify.app](https://speechread.netlify.app/)**
 - **[speechread.vercel.app](https://speechread.vercel.app/)**
-- **[GitHub Pages](https://sefga.github.io/SmartReader/)**
+- **[GitHub Pages](https://sefga.github.io/speechread/)**
 
 На каждом сайте нажмите «Открыть читалку без регистрации» или добавьте к адресу `reader/`. Материалы и прогресс хранятся отдельно для каждого домена в вашем браузере.
 

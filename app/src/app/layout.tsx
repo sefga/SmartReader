@@ -5,7 +5,7 @@ import './globals.css';
 const inter = localFont({src:'../../inter-font.woff2',display:'swap',variable:'--font-inter',weight:'100 900'});
 
 export const metadata: Metadata = {
-  title: 'SmartReader — читайте и слушайте',
+  title: 'speechread — читайте и слушайте',
   description: 'Личная читалка с подсветкой слов, аудио и сохранением прогресса.',
   icons: { icon: `${process.env.NEXT_PUBLIC_BASE_PATH ?? ''}/icon.svg` },
 };
