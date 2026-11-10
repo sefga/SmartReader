@@ -1,6 +1,6 @@
 export interface WordCue { word: string; start: number; end: number }
 export interface TextBlock { kind: 'heading' | 'paragraph'; text: string; first: number; count: number }
-export interface ReadingDocument { title: string; text: string; cues: WordCue[]; duration: number; position: number; audioName?: string; alignment?: { matched: number; total: number; estimated: number; boundaryWarning?: boolean } }
+export interface ReadingDocument { title: string; text: string; cues: WordCue[]; duration: number; position: number; audioName?: string; alignment?: { matched: number; total: number; estimated: number; boundaryWarning?: boolean; source?: 'local' | 'openai' | 'gemini' } }
 
 export const DEMO_TEXT = `# Читать в своём ритме
 

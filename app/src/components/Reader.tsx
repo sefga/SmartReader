@@ -5,7 +5,9 @@ import Icon from './Icons';
 import Modal from './Modal';
 import Publish from './Publish';
 import AudioCapture from './AudioCapture';
-import { DEMO_TEXT, estimateCues, findActiveWord, formatTime, parseText, validateCues, type ReadingDocument } from '../lib/sync';
+import SynchronizationPanel from './SynchronizationPanel';
+import { DEMO_TEXT, estimateCues, findActiveWord, formatTime, parseText, validateCues, type ReadingDocument, type WordCue } from '../lib/sync';
+import type { CloudSyncOptions } from '../lib/cloud-sync';
 import { loadReading, saveReading } from '../lib/storage';
 import type { SyncProgress } from '../lib/auto-sync';
 import { detectSilences, silenceEndAt, type AudioRange } from '../lib/silence';
@@ -37,6 +39,7 @@ export default function Reader() {
   const [readingText, setReadingText] = useState(false);
   const [playerCollapsed, setPlayerCollapsed] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
+  const [syncProvider, setSyncProvider] = useState<'local' | 'openai' | 'gemini'>('local');
   const [silences, setSilences] = useState<AudioRange[] | null>(null);
   const [skipSilence, setSkipSilence] = useState(false);
   const [silenceBusy, setSilenceBusy] = useState(false);
@@ -246,24 +249,26 @@ export default function Reader() {
     if (showNotice) setNotice('Синхронизация остановлена. Предыдущие метки сохранены.');
   }
 
-  async function startSync(target: ReadingDocument, source: Blob): Promise<void> {
+  async function startSync(target: ReadingDocument, source: Blob, options?: CloudSyncOptions): Promise<void> {
     cancelSync();
     const controller = new AbortController();
     syncController.current = controller;
-    setNotice('');setError('');setSyncProgress({stage:'loading',progress:0});
+    setNotice('');setError('');setSyncProvider(options?.provider??'local');setSyncProgress({stage:'loading',progress:0});
     try {
-      const { synchronizeAudio } = await import('../lib/auto-sync');
-      const result = await synchronizeAudio(target,source,controller.signal,progress=>{
+      const updateProgress = (progress: SyncProgress): void => {
         if (syncController.current === controller) setSyncProgress(progress);
-      });
+      };
+      const result = options
+        ? await (await import('../lib/cloud-sync')).synchronizeCloudAudio(target,source,options,controller.signal,updateProgress)
+        : await (await import('../lib/auto-sync')).synchronizeAudio(target,source,controller.signal,updateProgress);
       if (syncController.current !== controller || controller.signal.aborted) return;
-      setDocument(current=>current === target ? {...current,cues:result.cues,alignment:{matched:result.matched,total:result.total,estimated:result.estimated,boundaryWarning:result.boundaryWarning}} : current);
+      setDocument(current=>current === target ? {...current,cues:result.cues,alignment:{matched:result.matched,total:result.total,estimated:result.estimated,boundaryWarning:result.boundaryWarning,source:options?.provider??'local'}} : current);
       setExact(false);
-      setNotice(`Синхронизация завершена: совпало ${result.matched} из ${result.total} слов${result.estimated ? `, для ${result.estimated} время определено приблизительно` : ''}. ${result.boundaryWarning ? 'Не удалось уточнить границы фрагментов. ' : ''}Проверьте результат на слух.`);
+      setNotice(options?.provider==='gemini' ? 'Метки Gemini применены. Время слов оценено моделью; проверьте совпадение на слух.' : `Синхронизация завершена: совпало ${result.matched} из ${result.total} слов${result.estimated ? `, для ${result.estimated} время определено приблизительно` : ''}. ${result.boundaryWarning ? 'Не удалось уточнить границы фрагментов. ' : ''}Проверьте результат на слух.`);
     } catch (cause) {
       if (syncController.current !== controller || controller.signal.aborted) return;
       const message = cause instanceof Error ? cause.message : '';
-      setError(/^(Совпало|Текст и запись|В записи|Для некоторых слов|Не удалось определить длительность)/u.test(message) ? message : 'Не удалось синхронизировать запись. Проверьте подключение к интернету и формат аудио, затем попробуйте ещё раз.');
+      setError(options && message ? message : /^(Совпало|Текст и запись|В записи|Для некоторых слов|Не удалось определить длительность)/u.test(message) ? message : 'Не удалось синхронизировать запись. Проверьте подключение к интернету и формат аудио, затем попробуйте ещё раз.');
     } finally {
       if (syncController.current === controller) {syncController.current=null;setSyncProgress(null);}
     }
@@ -320,13 +325,8 @@ export default function Reader() {
     finally {probe.removeAttribute('src');probe.load();URL.revokeObjectURL(url);setBusy(false);}
   }
 
-  async function importTiming(file?: File): Promise<void> {
-    if(!file)return;
-    if(file.size>5_000_000){setError('Файл меток слишком большой. Максимум 5 МБ.');return;}
-    try {
-      const cues=validateCues(JSON.parse(await file.text()),words,document.duration);
-      cancelSync();pause();setDocument({...document,cues,alignment:undefined});setExact(true);setDialog('');setNotice('Точные метки применены. Подсветка следует за аудио.');setError('');
-    } catch(cause){setError(cause instanceof SyntaxError ? 'Файл должен содержать метки в формате JSON.' : cause instanceof Error ? cause.message : 'Не удалось прочитать метки.');}
+  function applyTiming(cues: WordCue[]): void {
+    cancelSync();pause();setDocument({...document,cues,alignment:undefined});setExact(true);setDialog('');setNotice('Метки JSON применены. Проверьте совпадение со звуком.');setError('');
   }
 
   function addBookmark(): void {
@@ -343,7 +343,7 @@ export default function Reader() {
       <div className="article-meta"><span>{words.length} слов</span><span>·</span><span>{Math.max(1,Math.ceil(document.duration/60))} мин</span><span>·</span><span>Сохранено на устройстве</span></div>
       <div className="reader-callout"><span className="callout-icon"><Icon name="volume"/></span><div><strong>Читайте. Слушайте. Следуйте за словами.</strong><p>{audioUrl ? 'Нажмите на слово, чтобы перейти к нему в аудио.' : 'Добавьте текст и аудиофайл своей статьи или послушайте пример.'}</p>{!audioUrl&&<button className="text-action demo-speech-button" onClick={()=>void togglePlayback()} disabled={!ready}>{playing?'Остановить пример':'Озвучить пример'}</button>}</div>{!audioUrl&&<button onClick={openImport} aria-label="Добавить свою статью"><Icon name="arrow"/></button>}</div>
       <button className="publication-cta" onClick={()=>{pause();setError('');setDialog('publish');}}>{audioUrl ? 'Скачать умную статью или аудио' : 'Как сохранить статью и озвучку'}<Icon name="arrow" size={16}/></button>
-      <div className="reader-toolbar"><button className={follow?'follow-toggle enabled':'follow-toggle'} onClick={()=>setFollow(v=>!v)} aria-pressed={follow}><span className="toggle-track"><span/></span>Следить за текстом</button>{audioBlob&&<button className={skipSilence?'follow-toggle enabled':'follow-toggle'} onClick={()=>void toggleSilence()} disabled={silenceBusy} aria-pressed={skipSilence}><span className="toggle-track"><span/></span>{silenceBusy?'Поиск пауз…':'Пропускать паузы'}</button>}<button className="timing-button" onClick={()=>{setError('');setDialog('timing');}}>{syncProgress ? 'Синхронизация…' : exact ? '✓ Точные метки' : document.alignment ? '✓ Автоматическая синхронизация' : audioUrl ? '≈ Приблизительная разметка' : 'Озвучка браузера'} <span>ⓘ</span></button></div>
+      <div className="reader-toolbar"><button className={follow?'follow-toggle enabled':'follow-toggle'} onClick={()=>setFollow(v=>!v)} aria-pressed={follow}><span className="toggle-track"><span/></span>Следить за текстом</button>{audioBlob&&<button className={skipSilence?'follow-toggle enabled':'follow-toggle'} onClick={()=>void toggleSilence()} disabled={silenceBusy} aria-pressed={skipSilence}><span className="toggle-track"><span/></span>{silenceBusy?'Поиск пауз…':'Пропускать паузы'}</button>}<button className="timing-button" aria-label="Способы синхронизации" onClick={()=>{setError('');setDialog('timing');}}>Синхронизация слов <span>ⓘ</span><small>{syncProgress ? 'Выполняется…' : exact ? '✓ Метки из JSON' : document.alignment?.source==='gemini' ? 'Оценка Gemini' : document.alignment?.source==='openai' ? '✓ OpenAI' : document.alignment ? '✓ Встроенный способ' : audioUrl ? '≈ Пока приблизительно' : 'Выбрать способ'}</small></button></div>
       <article ref={article} className="reading-article" style={{fontSize:`${fontSize}px`}} aria-label="Текст статьи">
         {blocks.map((block,index)=>{
           const text=words.slice(block.first,block.first+block.count).map((word,offset)=>{
@@ -364,7 +364,7 @@ export default function Reader() {
     </footer>}
     {audioUrl&&playerCollapsed&&<div className="audio-mini-player" role="group" aria-label="Свёрнутый плеер"><button className="icon-button" aria-label={playing?'Пауза':'Воспроизвести'} onClick={()=>void togglePlayback()}><Icon name={playing?'pause':'play'} size={18}/></button><button className="show-player" onClick={()=>setPlayerCollapsed(false)} aria-controls="audio-player-controls" aria-expanded="false">Показать плеер <span>{formatTime(position)}</span></button></div>}
     {audioUrl&&<audio ref={audio} src={audioUrl} preload="metadata" onLoadedMetadata={()=>{if(audio.current){audio.current.currentTime=restorePosition.current;audio.current.playbackRate=rate;}}} onTimeUpdate={()=>setPosition(readAudioPosition())} onPlay={()=>setPlaying(true)} onPause={()=>setPlaying(false)} onEnded={()=>setPlaying(false)} onError={()=>{setPlaying(false);setError('Не удалось воспроизвести аудио. Выберите поддерживаемый файл.');}}/>}
-    {syncProgress&&<div className="toast sync-toast" role="status"><span>{syncProgress.stage==='loading'?'Загрузка модели':syncProgress.stage==='decoding'?'Подготовка аудио':syncProgress.stage==='transcribing'?'Распознавание речи':syncProgress.stage==='refining'?'Уточнение стыков':'Сопоставление слов'} · {Math.round(Math.max(0,Math.min(1,syncProgress.progress))*100)}%</span><button onClick={()=>cancelSync(true)}>Отменить</button></div>}
+    {syncProgress&&<div className="toast sync-toast" role="status"><span>{syncProvider!=='local'?`${syncProvider==='openai'?'OpenAI':'Gemini'} · Распознавание и проверка меток…`:<>{syncProgress.stage==='loading'?'Загрузка модели':syncProgress.stage==='decoding'?'Подготовка аудио':syncProgress.stage==='transcribing'?'Распознавание речи':syncProgress.stage==='refining'?'Уточнение стыков':'Сопоставление слов'} · {Math.round(Math.max(0,Math.min(1,syncProgress.progress))*100)}%</>}</span><button onClick={()=>cancelSync(true)}>Отменить</button></div>}
     {!syncProgress&&notice&&<div className="toast" role="status">{notice}<button aria-label="Скрыть уведомление" onClick={()=>setNotice('')}><Icon name="close" size={16}/></button></div>}
     {!syncProgress&&error&&!dialog&&<div className="toast error" role="alert">{error}<button aria-label="Закрыть ошибку" onClick={()=>setError('')}><Icon name="close" size={16}/></button></div>}
     {dialog&&<Modal title={dialog==='publish'?'Сохранить материал':dialog==='import'?'Добавить материал':dialog==='settings'?'Настройки чтения':'Синхронизация слов'} closeDisabled={busy||capturing} onClose={()=>{if(!busy&&!capturing){textImportGeneration.current++;setReadingText(false);setDialog('');setError('');}}}>
@@ -385,12 +385,13 @@ export default function Reader() {
           <input id="material-text" type="file" aria-label="Выбрать текстовый файл" accept=".txt,.md,.markdown,text/plain,text/markdown" onChange={event=>{void addMaterialFiles(Array.from(event.target.files??[]));event.target.value='';}} disabled={busy}/>
         </div>
         <label>Текст статьи<textarea aria-label="Текст статьи" value={draftText} onChange={e=>{textImportGeneration.current++;setReadingText(false);setDraftText(e.target.value);setDraftTiming(undefined);}} rows={5} placeholder="Вставьте текст. Начните заголовок с #, чтобы добавить раздел в оглавление." required/></label>
-        <label className="auto-sync-option"><input type="checkbox" checked={autoSync} onChange={e=>setAutoSync(e.target.checked)} disabled={Boolean(draftTiming)}/><span>Автоматически синхронизировать слова с записью</span></label>
-        <p className="small-note">Необязательно. При первом запуске браузер скачает модель около 200 МБ. Текст и запись остаются на устройстве. Заголовки должны звучать в записи.</p>
+        <label className="auto-sync-option"><input type="checkbox" checked={autoSync} onChange={e=>setAutoSync(e.target.checked)} disabled={Boolean(draftTiming)}/><span>Автоматически синхронизировать слова с записью в браузере, без ключа</span></label>
+        <p className="small-note">При первом запуске скачивается модель примерно 200 МБ. Она распознаёт запись на вашем устройстве, затем сопоставляет слова с текстом. Текст и аудио остаются в браузере. Заголовки должны звучать в записи.</p>
+        <details><summary>Какие ещё есть способы синхронизации?</summary><p className="small-note">После создания статьи нажмите «Синхронизация слов» над текстом. Там доступны встроенный способ, OpenAI API, Gemini API, вставка готового JSON и промпты для другого чата. API использует ваш ключ и отправляет аудио выбранному сервису. Для быстрого открытия статьи можно отключить обработку сейчас и выбрать способ позже.</p></details>
         <details><summary>Есть готовые метки слов?</summary><label className="file-label">Метки слов <span>Необязательно · JSON</span><input type="file" accept=".json,application/json" onChange={e=>setDraftTiming(e.target.files?.[0])}/></label>{draftTiming&&<p className="small-note">Выбрано: {draftTiming.name}</p>}</details>
         {error&&<p className="form-error" role="alert">{error}</p>}
         <div className="import-actions"><button className="primary-button" disabled={busy||capturing||readingText} type="submit">{busy?'Открываем материал…':capturing?'Завершите запись':readingText?'Читаем текст…':'Создать статью'}<Icon name="arrow" size={18}/></button></div>
-      </form>:dialog==='settings'?<div className="settings-panel"><label>Размер текста <strong>{fontSize} px</strong><input type="range" min="16" max="30" value={fontSize} onChange={e=>setFontSize(Number(e.target.value))}/></label><button className="setting-row" onClick={()=>setFollow(v=>!v)}>Автопрокрутка <span>{follow?'Включена':'Выключена'}</span></button>{bookmark!==null&&<button className="setting-row" onClick={()=>{seek(bookmark);setDialog('');}}>Перейти к закладке <span>{formatTime(bookmark)}</span></button>}<p className="muted">Пробел — пауза. Стрелки ← и → — перемотка на 15 секунд. Нажмите на слово, чтобы перейти к нему.</p></div>:<div className="timing-panel"><p>{exact?'Подключены метки каждого слова из JSON.':document.alignment?`Автоматически сопоставлено ${document.alignment.matched} из ${document.alignment.total} слов. Для ${document.alignment.estimated} слов время рассчитано приблизительно. ${document.alignment.boundaryWarning?'Не удалось уточнить границы фрагментов. ':''}Проверьте совпадение на слух.`:audioUrl?'Сейчас используется приблизительная разметка по длине слов. Паузы и интонация могут смещать подсветку.':'Пример озвучивается голосом браузера. Точность выделения зависит от поддержки событий озвучки.'}</p>{audioBlob&&<><button className="primary-button" disabled={Boolean(syncProgress)} onClick={()=>{setDialog('');void startSync(document,audioBlob);}}>{syncProgress?'Синхронизация выполняется…':'Синхронизировать автоматически'}</button><p className="small-note">Речь распознаётся на устройстве. При первом запуске требуется скачать модель около 200 МБ; обработка может занять несколько минут.</p></>}<p>Также можно загрузить метки слов для этого текста и аудио. Время указывается в секундах, включая заголовки.</p><pre>{'[{"word":"Читать","start":0,"end":0.6},\n {"word":"в","start":0.6,"end":0.8}, …]'}</pre>{audioUrl?<label className="file-label">Загрузить метки JSON<input type="file" accept=".json,application/json" onChange={e=>void importTiming(e.target.files?.[0])}/></label>:<button className="primary-button" onClick={openImport}>Добавить текст и аудио</button>}{error&&<p className="form-error" role="alert">{error}</p>}</div>}
+      </form>:dialog==='settings'?<div className="settings-panel"><label>Размер текста <strong>{fontSize} px</strong><input type="range" min="16" max="30" value={fontSize} onChange={e=>setFontSize(Number(e.target.value))}/></label><button className="setting-row" onClick={()=>setFollow(v=>!v)}>Автопрокрутка <span>{follow?'Включена':'Выключена'}</span></button>{bookmark!==null&&<button className="setting-row" onClick={()=>{seek(bookmark);setDialog('');}}>Перейти к закладке <span>{formatTime(bookmark)}</span></button>}<p className="muted">Пробел — пауза. Стрелки ← и → — перемотка на 15 секунд. Нажмите на слово, чтобы перейти к нему.</p></div>:<SynchronizationPanel document={document} exact={exact} hasAudio={Boolean(audioBlob)} syncing={Boolean(syncProgress)} onRun={options=>{if(audioBlob){setDialog('');void startSync(document,audioBlob,options);}}} onApply={applyTiming} onAddMaterial={openImport}/>}
     </Modal>}
   </div>;
 }
