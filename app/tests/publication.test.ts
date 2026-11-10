@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createEmbedCode, createPublication, publicationAudioName } from '../src/lib/publication.ts';
+import { createEmbedCode, createPublication, createStandalonePublication, publicationAudioName } from '../src/lib/publication.ts';
 import { estimateCues, parseText, type ReadingDocument } from '../src/lib/sync.ts';
 
 function example(text = '# Начало\n\nМоя статья.'): ReadingDocument {
@@ -20,6 +20,20 @@ test('Экспорт включает текст, метки и переноси
   assert.match(automatic, /Автоматическая синхронизация: возможны неточности/u);
   assert.doesNotMatch(automatic, /Точные метки слов/u);
   assert.throws(() => createPublication({ ...example(), cues: [] }, true));
+});
+
+test('Автономный HTML содержит полное аудио и интервалы пауз без соседних файлов',async()=>{
+  const bytes=Uint8Array.from({length:200_003},(_,index)=>index%251);
+  const page=await createStandalonePublication(example(),false,new Blob([bytes],{type:'audio/mpeg'}),{silences:[{start:3,end:5}]});
+  const html=await page.text();
+  const audio=html.match(/src="data:audio\/mpeg;base64,([A-Za-z0-9+/=]+)"/u)?.[1];
+  assert.ok(audio);
+  assert.deepEqual(new Uint8Array(Buffer.from(audio,'base64')),bytes);
+  assert.match(html,/Пропускать паузы/u);
+  assert.match(html,/const silences=\[\{"start":3,"end":5\}\]/u);
+  assert.doesNotMatch(html,/src="\.\/article-audio/u);
+  const aborted=new AbortController();aborted.abort();
+  await assert.rejects(createStandalonePublication(example(),false,new Blob([bytes],{type:'audio/mpeg'}),{signal:aborted.signal}),{name:'AbortError'});
 });
 
 test('Пользовательский текст и заголовок не могут добавить HTML или исполняемый код', () => {

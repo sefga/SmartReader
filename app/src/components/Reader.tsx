@@ -8,6 +8,8 @@ import AudioCapture from './AudioCapture';
 import { DEMO_TEXT, estimateCues, findActiveWord, formatTime, parseText, validateCues, type ReadingDocument } from '../lib/sync';
 import { loadReading, saveReading } from '../lib/storage';
 import type { SyncProgress } from '../lib/auto-sync';
+import { detectSilences, silenceEndAt, type AudioRange } from '../lib/silence';
+import { parseMaterialFiles } from '../lib/import-files';
 
 const initialWords = parseText(DEMO_TEXT).words;
 const initialDuration = initialWords.length / 2.6;
@@ -31,7 +33,13 @@ export default function Reader() {
   const [draftAudio, setDraftAudio] = useState<File>();
   const [draftTiming, setDraftTiming] = useState<File>();
   const [autoSync, setAutoSync] = useState(true);
+  const [dragging, setDragging] = useState(false);
+  const [readingText, setReadingText] = useState(false);
+  const [playerCollapsed, setPlayerCollapsed] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
+  const [silences, setSilences] = useState<AudioRange[] | null>(null);
+  const [skipSilence, setSkipSilence] = useState(false);
+  const [silenceBusy, setSilenceBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [notice, setNotice] = useState('');
@@ -45,10 +53,19 @@ export default function Reader() {
   const restorePosition = useRef(0);
   const speechGeneration = useRef(0);
   const syncController = useRef<AbortController | null>(null);
+  const silenceController = useRef<AbortController | null>(null);
+  const textImportGeneration = useRef(0);
   const {blocks, words} = useMemo(()=>parseText(document.text),[document.text]);
   const active = findActiveWord(document.cues,position);
   const headings = blocks.map((block,index)=>({block,index})).filter(({block})=>block.kind === 'heading');
   const audioPercent = document.duration ? Math.min(100, Math.round(position/document.duration*100)) : 0;
+  const readAudioPosition = useCallback((): number => {
+    const player = audio.current;
+    if (!player) return 0;
+    const end = !player.paused && skipSilence && silences ? silenceEndAt(silences,player.currentTime) : undefined;
+    if (end !== undefined) player.currentTime = end;
+    return player.currentTime;
+  },[skipSilence,silences]);
 
   useEffect(()=> {
     if(window.innerWidth<=760) setFontSize(17);
@@ -99,14 +116,19 @@ export default function Reader() {
 
   useEffect(()=> { if (audio.current) audio.current.playbackRate = rate; },[rate,audioUrl]);
 
-  useEffect(()=>()=>syncController.current?.abort(),[]);
+  useEffect(()=>()=>{syncController.current?.abort();textImportGeneration.current++;},[]);
+
+  useEffect(()=> {
+    setSilences(null);setSkipSilence(false);setSilenceBusy(false);
+    return ()=>{silenceController.current?.abort();silenceController.current=null;};
+  },[audioBlob]);
 
   useEffect(()=> {
     if (!playing || !audioUrl) return;
     let frame = 0, lastWord = -2;
     const update = () => {
-      const current = audio.current?.currentTime;
-      if (current !== undefined) {
+      const current = readAudioPosition();
+      if (audio.current) {
         const word = findActiveWord(document.cues,current);
         if (word !== lastWord) {lastWord = word;setPosition(current);}
       }
@@ -114,7 +136,7 @@ export default function Reader() {
     };
     frame = requestAnimationFrame(update);
     return ()=>cancelAnimationFrame(frame);
-  },[playing,audioUrl,document.cues]);
+  },[playing,audioUrl,document.cues,readAudioPosition]);
 
   useEffect(()=> {
     if (!follow || !playing || active < 0) return;
@@ -188,7 +210,7 @@ export default function Reader() {
   useEffect(()=> {
     const key = (event: KeyboardEvent) => {
       const element=event.target as HTMLElement;
-      if(dialog || element.closest('input,textarea,select,button,a,[role="button"]')) return;
+      if(!audioUrl || dialog || element.closest('input,textarea,select,button,a,[role="button"]')) return;
       if(event.code==='Space'){event.preventDefault();void togglePlayback();}
       if(event.code==='ArrowLeft'){event.preventDefault();seek(positionRef.current-15);}
       if(event.code==='ArrowRight'){event.preventDefault();seek(positionRef.current+15);}
@@ -198,7 +220,23 @@ export default function Reader() {
   });
 
   function openImport(): void {
-    pause();setDraftText(document.text);setDraftTitle(document.title);setDraftAudio(undefined);setDraftTiming(undefined);setError('');setDialog('import');
+    textImportGeneration.current++;
+    pause();setReadingText(false);setDraftText(audioBlob?document.text:'');setDraftTitle(audioBlob?document.title:'');setDraftAudio(undefined);setDraftTiming(undefined);setDragging(false);setError('');setDialog('import');
+  }
+
+  async function toggleSilence(): Promise<void> {
+    if (skipSilence) {setSkipSilence(false);return;}
+    if (!audioBlob || silenceBusy) return;
+    if (silences) {setSkipSilence(true);return;}
+    const controller = new AbortController();silenceController.current=controller;setSilenceBusy(true);setError('');
+    try {
+      const ranges=await detectSilences(audioBlob,document.duration,{signal:controller.signal});
+      if (controller.signal.aborted) return;
+      setSilences(ranges);setSkipSilence(true);
+      setNotice(ranges.length ? `Пропуск пауз включён: найдено ${ranges.length}.` : 'Длинные тихие паузы не найдены.');
+    } catch (cause) {
+      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : 'Не удалось определить паузы.');
+    } finally {if(silenceController.current===controller){silenceController.current=null;setSilenceBusy(false);}}
   }
 
   function cancelSync(showNotice = false): void {
@@ -231,14 +269,29 @@ export default function Reader() {
     }
   }
 
-  async function readTextFile(file?: File): Promise<void> {
-    if(!file)return;
-    if(file.size>2_000_000){setError('Текст слишком большой. Максимум 2 МБ.');return;}
-    try {setDraftText(await file.text());setDraftTitle(file.name.replace(/\.[^.]+$/u,''));setError('');} catch {setError('Не удалось прочитать текстовый файл.');}
+  async function addMaterialFiles(files: File[]): Promise<void> {
+    if (busy || !files.length) return;
+    let attempt: number | undefined;
+    try {
+      const selected = parseMaterialFiles(files);
+      if (selected.audio && capturing) throw new Error('Завершите запись вкладки перед заменой аудио. Текст можно добавить сейчас.');
+      if (selected.audio) setDraftAudio(selected.audio);
+      setDraftTiming(undefined);setError('');
+      if (selected.text) {
+        attempt = ++textImportGeneration.current;
+        setReadingText(true);setDraftTitle(selected.text.name.replace(/\.[^.]+$/u,''));
+        const text = await selected.text.text();
+        if (attempt === textImportGeneration.current) setDraftText(text);
+      }
+    } catch (cause) {
+      if (attempt === undefined || attempt === textImportGeneration.current) setError(cause instanceof Error ? cause.message : 'Не удалось прочитать файл.');
+    } finally {
+      if (attempt === textImportGeneration.current) setReadingText(false);
+    }
   }
 
   async function importDocument(): Promise<void> {
-    if (busy || capturing) return;
+    if (busy || capturing || readingText) return;
     const content = parseText(draftText);
     if(!content.words.length){setError('Добавьте текст статьи.');return;}
     if(content.words.length>30_000){setError('Для этой версии выберите статью до 30 000 слов.');return;}
@@ -259,7 +312,7 @@ export default function Reader() {
       cancelSync();
       const nextDocument: ReadingDocument = {title:draftTitle.trim() || content.blocks[0]?.text.slice(0,90) || 'Моя статья',text:draftText.trim(),cues,duration,position:0,audioName:draftAudio.name};
       setDocument(nextDocument);
-      restorePosition.current=0;setPosition(0);setBookmark(null);setAudioBlob(draftAudio);setExact(Boolean(draftTiming));setCanSave(true);setDialog('');setNotice('Материал открыт. Текст и аудио сохраняются в этом браузере.');
+      restorePosition.current=0;setPosition(0);setBookmark(null);setAudioBlob(draftAudio);setPlayerCollapsed(false);setExact(Boolean(draftTiming));setCanSave(true);setDialog('');setNotice('Материал открыт. Текст и аудио сохраняются в этом браузере.');
       try {localStorage.setItem('reader-position','0');localStorage.removeItem('reader-bookmark');} catch { /* Чтение доступно и без локального хранилища. */ }
       window.scrollTo({top:0,behavior:'instant'});
       if (autoSync && !draftTiming) void startSync(nextDocument,draftAudio);
@@ -281,16 +334,16 @@ export default function Reader() {
     try {localStorage.setItem('reader-bookmark',String(position));setNotice(`Закладка сохранена: ${formatTime(position)}.`);} catch {setNotice('Закладка доступна до закрытия страницы.');}
   }
 
-  return <div className="reader-app">
+  return <div className={`reader-app${!audioUrl ? ' without-audio' : playerCollapsed ? ' player-collapsed' : ''}`}>
     <header className="reader-topbar"><Link href="/" className="reader-brand" aria-label="speechread — главная"><Icon name="book" size={24}/><span>speechread</span></Link><div className="reader-top-actions"><button className="upload-button publish-button" onClick={()=>{pause();setError('');setDialog('publish');}} aria-label="Сохранить материал"><Icon name="arrow" size={17}/><span>Сохранить</span></button><button className="upload-button" onClick={openImport} aria-label="Добавить материал"><Icon name="upload" size={17}/><span>Добавить материал</span></button></div></header>
     <nav className="reading-nav" aria-label="Разделы статьи"><span className="reading-percent" title="Прогресс чтения">{readPercent}%</span><div className="section-links">{headings.map(({block,index})=><a href={`#section-${index}`} key={index} className={section===index?'is-active':''} onClick={()=>setFollow(false)}>{block.text}</a>)}</div><div className="reading-line"><span style={{width:`${readPercent}%`}}/></div></nav>
     <main className="reader-main">
       <div className="article-eyebrow"><span className="live-dot"/>{audioUrl ? 'ВАША СТАТЬЯ' : 'ПОПРОБУЙТЕ ЧИТАЛКУ'}<span>ТЕКСТ + АУДИО</span></div>
       <div className="article-title-row"><h1>{document.title}</h1><button className="icon-button" onClick={()=>setDialog('settings')} aria-label="Настройки чтения"><Icon name="settings"/></button></div>
       <div className="article-meta"><span>{words.length} слов</span><span>·</span><span>{Math.max(1,Math.ceil(document.duration/60))} мин</span><span>·</span><span>Сохранено на устройстве</span></div>
-      <div className="reader-callout"><span className="callout-icon"><Icon name="volume"/></span><div><strong>Читайте. Слушайте. Следуйте за словами.</strong><p>{audioUrl ? 'Нажмите на слово, чтобы перейти к нему в аудио.' : 'Озвучьте пример или добавьте текст и аудиофайл своей статьи.'}</p></div>{!audioUrl&&<button onClick={openImport} aria-label="Добавить свою статью"><Icon name="arrow"/></button>}</div>
-      <button className="publication-cta" onClick={()=>{pause();setError('');setDialog('publish');}}>{audioUrl ? 'Скачать статью и аудио для личного архива' : 'Как сохранить статью и озвучку'}<Icon name="arrow" size={16}/></button>
-      <div className="reader-toolbar"><button className={follow?'follow-toggle enabled':'follow-toggle'} onClick={()=>setFollow(v=>!v)} aria-pressed={follow}><span className="toggle-track"><span/></span>Следить за текстом</button><button className="timing-button" onClick={()=>{setError('');setDialog('timing');}}>{syncProgress ? 'Синхронизация…' : exact ? '✓ Точные метки' : document.alignment ? '✓ Автоматическая синхронизация' : audioUrl ? '≈ Приблизительная разметка' : 'Озвучка браузера'} <span>ⓘ</span></button></div>
+      <div className="reader-callout"><span className="callout-icon"><Icon name="volume"/></span><div><strong>Читайте. Слушайте. Следуйте за словами.</strong><p>{audioUrl ? 'Нажмите на слово, чтобы перейти к нему в аудио.' : 'Добавьте текст и аудиофайл своей статьи или послушайте пример.'}</p>{!audioUrl&&<button className="text-action demo-speech-button" onClick={()=>void togglePlayback()} disabled={!ready}>{playing?'Остановить пример':'Озвучить пример'}</button>}</div>{!audioUrl&&<button onClick={openImport} aria-label="Добавить свою статью"><Icon name="arrow"/></button>}</div>
+      <button className="publication-cta" onClick={()=>{pause();setError('');setDialog('publish');}}>{audioUrl ? 'Скачать умную статью или аудио' : 'Как сохранить статью и озвучку'}<Icon name="arrow" size={16}/></button>
+      <div className="reader-toolbar"><button className={follow?'follow-toggle enabled':'follow-toggle'} onClick={()=>setFollow(v=>!v)} aria-pressed={follow}><span className="toggle-track"><span/></span>Следить за текстом</button>{audioBlob&&<button className={skipSilence?'follow-toggle enabled':'follow-toggle'} onClick={()=>void toggleSilence()} disabled={silenceBusy} aria-pressed={skipSilence}><span className="toggle-track"><span/></span>{silenceBusy?'Поиск пауз…':'Пропускать паузы'}</button>}<button className="timing-button" onClick={()=>{setError('');setDialog('timing');}}>{syncProgress ? 'Синхронизация…' : exact ? '✓ Точные метки' : document.alignment ? '✓ Автоматическая синхронизация' : audioUrl ? '≈ Приблизительная разметка' : 'Озвучка браузера'} <span>ⓘ</span></button></div>
       <article ref={article} className="reading-article" style={{fontSize:`${fontSize}px`}} aria-label="Текст статьи">
         {blocks.map((block,index)=>{
           const text=words.slice(block.first,block.first+block.count).map((word,offset)=>{
@@ -302,32 +355,41 @@ export default function Reader() {
       </article>
       <div className="article-end"><span>Вы дочитали до конца</span><button onClick={()=>{seek(0);window.scrollTo({top:0,behavior:'smooth'});}}>Вернуться к началу ↑</button></div>
     </main>
-    <footer className="audio-player" aria-label="Аудиоплеер">
+    {audioUrl&&<footer className="audio-player" id="audio-player-controls" aria-label="Аудиоплеер" hidden={playerCollapsed}>
       <div className="audio-player-inner"><div className="player-track"><span className="track-cover"><Icon name="book" size={22}/></span><div><strong>{document.title}</strong><span>{document.audioName || 'Пример · озвучка браузера'}</span></div></div>
         <div className="player-controls"><button className="skip-button" aria-label="Назад на 15 секунд" onClick={()=>seek(position-15)}><Icon name="back" size={25}/></button><button className="play-button" aria-label={playing?'Пауза':'Воспроизвести'} onClick={()=>void togglePlayback()} disabled={!ready}><Icon name={playing?'pause':'play'} size={24}/></button><button className="skip-button" aria-label="Вперёд на 15 секунд" onClick={()=>seek(position+15)}><Icon name="forward" size={25}/></button></div>
-        <div className="player-options"><label className="speed-select"><span className="sr-only">Скорость воспроизведения</span><select value={rate} onChange={e=>{pause();setRate(Number(e.target.value));}}>{[0.5,0.75,1,1.25,1.5,1.75,2].map(value=><option key={value} value={value}>{value}×</option>)}</select></label><button className={`icon-button ${bookmark!==null?'bookmarked':''}`} onClick={addBookmark} aria-label="Поставить закладку"><Icon name="bookmark"/></button></div>
+        <div className="player-options"><label className="speed-select"><span className="sr-only">Скорость воспроизведения</span><select value={rate} onChange={e=>{pause();setRate(Number(e.target.value));}}>{[0.5,0.75,1,1.25,1.5,1.75,2].map(value=><option key={value} value={value}>{value}×</option>)}</select></label><button className={`icon-button ${bookmark!==null?'bookmarked':''}`} onClick={addBookmark} aria-label="Поставить закладку"><Icon name="bookmark"/></button><button className="icon-button" onClick={()=>setPlayerCollapsed(true)} aria-label="Свернуть плеер" aria-controls="audio-player-controls" aria-expanded="true"><Icon name="close" size={18}/></button></div>
         <div className="player-timeline"><span>{formatTime(position)}</span><input aria-label="Позиция аудио" type="range" min="0" max={document.duration} step="0.05" value={position} onChange={e=>seek(Number(e.target.value))} style={{'--progress':`${audioPercent}%`} as React.CSSProperties}/><span>{formatTime(document.duration)}</span><span className="audio-percent">{audioPercent}%</span></div>
       </div>
-      {audioUrl&&<audio ref={audio} src={audioUrl} preload="metadata" onLoadedMetadata={()=>{if(audio.current){audio.current.currentTime=restorePosition.current;audio.current.playbackRate=rate;}}} onTimeUpdate={()=>setPosition(audio.current?.currentTime??0)} onPlay={()=>setPlaying(true)} onPause={()=>setPlaying(false)} onEnded={()=>setPlaying(false)} onError={()=>{setPlaying(false);setError('Не удалось воспроизвести аудио. Выберите поддерживаемый файл.');}}/>}
-    </footer>
+    </footer>}
+    {audioUrl&&playerCollapsed&&<div className="audio-mini-player" role="group" aria-label="Свёрнутый плеер"><button className="icon-button" aria-label={playing?'Пауза':'Воспроизвести'} onClick={()=>void togglePlayback()}><Icon name={playing?'pause':'play'} size={18}/></button><button className="show-player" onClick={()=>setPlayerCollapsed(false)} aria-controls="audio-player-controls" aria-expanded="false">Показать плеер <span>{formatTime(position)}</span></button></div>}
+    {audioUrl&&<audio ref={audio} src={audioUrl} preload="metadata" onLoadedMetadata={()=>{if(audio.current){audio.current.currentTime=restorePosition.current;audio.current.playbackRate=rate;}}} onTimeUpdate={()=>setPosition(readAudioPosition())} onPlay={()=>setPlaying(true)} onPause={()=>setPlaying(false)} onEnded={()=>setPlaying(false)} onError={()=>{setPlaying(false);setError('Не удалось воспроизвести аудио. Выберите поддерживаемый файл.');}}/>}
     {syncProgress&&<div className="toast sync-toast" role="status"><span>{syncProgress.stage==='loading'?'Загрузка модели':syncProgress.stage==='decoding'?'Подготовка аудио':syncProgress.stage==='transcribing'?'Распознавание речи':syncProgress.stage==='refining'?'Уточнение стыков':'Сопоставление слов'} · {Math.round(Math.max(0,Math.min(1,syncProgress.progress))*100)}%</span><button onClick={()=>cancelSync(true)}>Отменить</button></div>}
     {!syncProgress&&notice&&<div className="toast" role="status">{notice}<button aria-label="Скрыть уведомление" onClick={()=>setNotice('')}><Icon name="close" size={16}/></button></div>}
     {!syncProgress&&error&&!dialog&&<div className="toast error" role="alert">{error}<button aria-label="Закрыть ошибку" onClick={()=>setError('')}><Icon name="close" size={16}/></button></div>}
-    {dialog&&<Modal title={dialog==='publish'?'Сохранить материал':dialog==='import'?'Добавить материал':dialog==='settings'?'Настройки чтения':'Синхронизация слов'} closeDisabled={busy||capturing} onClose={()=>{if(!busy&&!capturing){setDialog('');setError('');}}}>
-      {dialog==='publish'?<Publish document={document} audio={audioBlob} exact={exact} onImport={openImport}/>:dialog==='import'?<form className="import-form" onSubmit={e=>{e.preventDefault();void importDocument();}}>
-        <p className="muted">Ваша статья и её озвучка. Файлы остаются на устройстве.</p>
-        <p className="small-note">Аудиофайл можно загрузить или записать из выбранной вкладки для личного архива.</p>
+    {dialog&&<Modal title={dialog==='publish'?'Сохранить материал':dialog==='import'?'Добавить материал':dialog==='settings'?'Настройки чтения':'Синхронизация слов'} closeDisabled={busy||capturing} onClose={()=>{if(!busy&&!capturing){textImportGeneration.current++;setReadingText(false);setDialog('');setError('');}}}>
+      {dialog==='publish'?<Publish document={document} audio={audioBlob} exact={exact} syncing={Boolean(syncProgress)} silences={silences} onSilences={setSilences} onImport={openImport}/>:dialog==='import'?<form className={`import-form${dragging?' is-dragging':''}`} onSubmit={e=>{e.preventDefault();void importDocument();}}
+        onDragOver={event=>{if(event.dataTransfer.types.includes('Files')){event.preventDefault();event.dataTransfer.dropEffect='copy';setDragging(true);}}}
+        onDragLeave={event=>{if(!event.currentTarget.contains(event.relatedTarget as Node | null))setDragging(false);}}
+        onDrop={event=>{event.preventDefault();setDragging(false);void addMaterialFiles(Array.from(event.dataTransfer.files));}}>
+        <p className="muted">Добавьте текст и звук в любом порядке. Файлы можно выбрать или перетащить сюда — по одному или вместе.</p>
+        <div className="file-drop" role="group" aria-label="Аудиофайл">
+          <label className="file-label" htmlFor="material-audio">Аудиофайл <span>Перетащите MP3, WAV, M4A, OGG, WebM или WEBA · до 150 МБ</span></label>
+          <input id="material-audio" type="file" aria-label="Выбрать аудиофайл" accept="audio/*,.m4a,.webm,.weba,.mp4" onChange={event=>{void addMaterialFiles(Array.from(event.target.files??[]));event.target.value='';}} disabled={busy||capturing}/>
+          {draftAudio&&<p className="small-note selected-audio" role="status">Аудио: {draftAudio.name}</p>}
+        </div>
+        <AudioCapture onCapture={file=>{setDraftAudio(file);setDraftTiming(undefined);setError('');}} onActiveChange={setCapturing}/>
         <label>Название<input value={draftTitle} onChange={e=>setDraftTitle(e.target.value)} placeholder="Название статьи" maxLength={150}/></label>
-        <label className="file-label">Текстовый файл <span>TXT, Markdown · до 2 МБ</span><input type="file" accept=".txt,.md,text/plain,text/markdown" onChange={e=>void readTextFile(e.target.files?.[0])}/></label>
-        <label>Текст статьи<textarea aria-label="Текст статьи" value={draftText} onChange={e=>setDraftText(e.target.value)} rows={7} placeholder="Вставьте текст. Начните заголовок с #, чтобы добавить раздел в оглавление." required/></label>
-        <label className="file-label">Аудио <span>MP3, WAV, M4A, OGG, WebM, WEBA · до 150 МБ</span><input type="file" accept="audio/*,.m4a,.webm,.weba" onChange={e=>setDraftAudio(e.target.files?.[0])} required={!draftAudio} disabled={capturing}/></label>
-        <AudioCapture onCapture={file=>{setDraftAudio(file);setError('');}} onActiveChange={setCapturing}/>
-        {draftAudio&&<p className="small-note selected-audio">К импорту: {draftAudio.name}</p>}
-        <label className="file-label">Метки слов <span>Необязательно · JSON</span><input type="file" accept=".json,application/json" onChange={e=>setDraftTiming(e.target.files?.[0])}/></label>
+        <div className="file-drop" role="group" aria-label="Текстовый файл">
+          <label className="file-label" htmlFor="material-text">Текстовый файл <span>Перетащите TXT или Markdown · до 2 МБ</span></label>
+          <input id="material-text" type="file" aria-label="Выбрать текстовый файл" accept=".txt,.md,.markdown,text/plain,text/markdown" onChange={event=>{void addMaterialFiles(Array.from(event.target.files??[]));event.target.value='';}} disabled={busy}/>
+        </div>
+        <label>Текст статьи<textarea aria-label="Текст статьи" value={draftText} onChange={e=>{textImportGeneration.current++;setReadingText(false);setDraftText(e.target.value);setDraftTiming(undefined);}} rows={5} placeholder="Вставьте текст. Начните заголовок с #, чтобы добавить раздел в оглавление." required/></label>
         <label className="auto-sync-option"><input type="checkbox" checked={autoSync} onChange={e=>setAutoSync(e.target.checked)} disabled={Boolean(draftTiming)}/><span>Автоматически синхронизировать слова с записью</span></label>
-        <p className="small-note">При первом запуске браузер скачает модель около 200 МБ. Текст и запись остаются на устройстве. Заголовки тоже должны звучать в записи. При наличии JSON используются его метки.</p>
+        <p className="small-note">Необязательно. При первом запуске браузер скачает модель около 200 МБ. Текст и запись остаются на устройстве. Заголовки должны звучать в записи.</p>
+        <details><summary>Есть готовые метки слов?</summary><label className="file-label">Метки слов <span>Необязательно · JSON</span><input type="file" accept=".json,application/json" onChange={e=>setDraftTiming(e.target.files?.[0])}/></label>{draftTiming&&<p className="small-note">Выбрано: {draftTiming.name}</p>}</details>
         {error&&<p className="form-error" role="alert">{error}</p>}
-        <button className="primary-button" disabled={busy||capturing} type="submit">{busy?'Открываем материал…':capturing?'Завершите запись, чтобы продолжить':'Начать чтение'}<Icon name="arrow" size={18}/></button>
+        <div className="import-actions"><button className="primary-button" disabled={busy||capturing||readingText} type="submit">{busy?'Открываем материал…':capturing?'Завершите запись':readingText?'Читаем текст…':'Создать статью'}<Icon name="arrow" size={18}/></button></div>
       </form>:dialog==='settings'?<div className="settings-panel"><label>Размер текста <strong>{fontSize} px</strong><input type="range" min="16" max="30" value={fontSize} onChange={e=>setFontSize(Number(e.target.value))}/></label><button className="setting-row" onClick={()=>setFollow(v=>!v)}>Автопрокрутка <span>{follow?'Включена':'Выключена'}</span></button>{bookmark!==null&&<button className="setting-row" onClick={()=>{seek(bookmark);setDialog('');}}>Перейти к закладке <span>{formatTime(bookmark)}</span></button>}<p className="muted">Пробел — пауза. Стрелки ← и → — перемотка на 15 секунд. Нажмите на слово, чтобы перейти к нему.</p></div>:<div className="timing-panel"><p>{exact?'Подключены метки каждого слова из JSON.':document.alignment?`Автоматически сопоставлено ${document.alignment.matched} из ${document.alignment.total} слов. Для ${document.alignment.estimated} слов время рассчитано приблизительно. ${document.alignment.boundaryWarning?'Не удалось уточнить границы фрагментов. ':''}Проверьте совпадение на слух.`:audioUrl?'Сейчас используется приблизительная разметка по длине слов. Паузы и интонация могут смещать подсветку.':'Пример озвучивается голосом браузера. Точность выделения зависит от поддержки событий озвучки.'}</p>{audioBlob&&<><button className="primary-button" disabled={Boolean(syncProgress)} onClick={()=>{setDialog('');void startSync(document,audioBlob);}}>{syncProgress?'Синхронизация выполняется…':'Синхронизировать автоматически'}</button><p className="small-note">Речь распознаётся на устройстве. При первом запуске требуется скачать модель около 200 МБ; обработка может занять несколько минут.</p></>}<p>Также можно загрузить метки слов для этого текста и аудио. Время указывается в секундах, включая заголовки.</p><pre>{'[{"word":"Читать","start":0,"end":0.6},\n {"word":"в","start":0.6,"end":0.8}, …]'}</pre>{audioUrl?<label className="file-label">Загрузить метки JSON<input type="file" accept=".json,application/json" onChange={e=>void importTiming(e.target.files?.[0])}/></label>:<button className="primary-button" onClick={openImport}>Добавить текст и аудио</button>}{error&&<p className="form-error" role="alert">{error}</p>}</div>}
     </Modal>}
   </div>;

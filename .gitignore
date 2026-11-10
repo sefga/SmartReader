@@ -5,6 +5,7 @@
 **/output/
 **/.npm-cache/
 **/*.tsbuildinfo
+/.playwright-mcp/
 
 # Секреты и локальные настройки
 .env
