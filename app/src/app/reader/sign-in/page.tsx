@@ -1,2 +1,2 @@
-import Auth from '../../../components/Auth';
-export default function SignIn() { return <Auth mode="sign-in" />; }
+import Reader from '../../../components/Reader';
+export default function SignIn() { return <Reader />; }

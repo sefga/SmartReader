@@ -1,2 +1,2 @@
-import Auth from '../../../components/Auth';
-export default function SignUp() { return <Auth mode="sign-up" />; }
+import Reader from '../../../components/Reader';
+export default function SignUp() { return <Reader />; }
