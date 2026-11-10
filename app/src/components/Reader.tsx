@@ -7,6 +7,7 @@ import Publish from './Publish';
 import AudioCapture from './AudioCapture';
 import { DEMO_TEXT, estimateCues, findActiveWord, formatTime, parseText, validateCues, type ReadingDocument } from '../lib/sync';
 import { loadReading, saveReading } from '../lib/storage';
+import type { SyncProgress } from '../lib/auto-sync';
 
 const initialWords = parseText(DEMO_TEXT).words;
 const initialDuration = initialWords.length / 2.6;
@@ -29,6 +30,8 @@ export default function Reader() {
   const [draftTitle, setDraftTitle] = useState('');
   const [draftAudio, setDraftAudio] = useState<File>();
   const [draftTiming, setDraftTiming] = useState<File>();
+  const [autoSync, setAutoSync] = useState(true);
+  const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
   const [busy, setBusy] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [notice, setNotice] = useState('');
@@ -41,6 +44,7 @@ export default function Reader() {
   const positionRef = useRef(0);
   const restorePosition = useRef(0);
   const speechGeneration = useRef(0);
+  const syncController = useRef<AbortController | null>(null);
   const {blocks, words} = useMemo(()=>parseText(document.text),[document.text]);
   const active = findActiveWord(document.cues,position);
   const headings = blocks.map((block,index)=>({block,index})).filter(({block})=>block.kind === 'heading');
@@ -94,6 +98,23 @@ export default function Reader() {
   },[document,audioBlob,exact,ready,canSave]);
 
   useEffect(()=> { if (audio.current) audio.current.playbackRate = rate; },[rate,audioUrl]);
+
+  useEffect(()=>()=>syncController.current?.abort(),[]);
+
+  useEffect(()=> {
+    if (!playing || !audioUrl) return;
+    let frame = 0, lastWord = -2;
+    const update = () => {
+      const current = audio.current?.currentTime;
+      if (current !== undefined) {
+        const word = findActiveWord(document.cues,current);
+        if (word !== lastWord) {lastWord = word;setPosition(current);}
+      }
+      frame = requestAnimationFrame(update);
+    };
+    frame = requestAnimationFrame(update);
+    return ()=>cancelAnimationFrame(frame);
+  },[playing,audioUrl,document.cues]);
 
   useEffect(()=> {
     if (!follow || !playing || active < 0) return;
@@ -180,6 +201,36 @@ export default function Reader() {
     pause();setDraftText(document.text);setDraftTitle(document.title);setDraftAudio(undefined);setDraftTiming(undefined);setError('');setDialog('import');
   }
 
+  function cancelSync(showNotice = false): void {
+    syncController.current?.abort();
+    syncController.current = null;
+    setSyncProgress(null);
+    if (showNotice) setNotice('Синхронизация остановлена. Предыдущие метки сохранены.');
+  }
+
+  async function startSync(target: ReadingDocument, source: Blob): Promise<void> {
+    cancelSync();
+    const controller = new AbortController();
+    syncController.current = controller;
+    setNotice('');setError('');setSyncProgress({stage:'loading',progress:0});
+    try {
+      const { synchronizeAudio } = await import('../lib/auto-sync');
+      const result = await synchronizeAudio(target,source,controller.signal,progress=>{
+        if (syncController.current === controller) setSyncProgress(progress);
+      });
+      if (syncController.current !== controller || controller.signal.aborted) return;
+      setDocument(current=>current === target ? {...current,cues:result.cues,alignment:{matched:result.matched,total:result.total,estimated:result.estimated,boundaryWarning:result.boundaryWarning}} : current);
+      setExact(false);
+      setNotice(`Синхронизация завершена: совпало ${result.matched} из ${result.total} слов${result.estimated ? `, для ${result.estimated} время определено приблизительно` : ''}. ${result.boundaryWarning ? 'Не удалось уточнить границы фрагментов. ' : ''}Проверьте результат на слух.`);
+    } catch (cause) {
+      if (syncController.current !== controller || controller.signal.aborted) return;
+      const message = cause instanceof Error ? cause.message : '';
+      setError(/^(Совпало|Текст и запись|В записи|Для некоторых слов|Не удалось определить длительность)/u.test(message) ? message : 'Не удалось синхронизировать запись. Проверьте подключение к интернету и формат аудио, затем попробуйте ещё раз.');
+    } finally {
+      if (syncController.current === controller) {syncController.current=null;setSyncProgress(null);}
+    }
+  }
+
   async function readTextFile(file?: File): Promise<void> {
     if(!file)return;
     if(file.size>2_000_000){setError('Текст слишком большой. Максимум 2 МБ.');return;}
@@ -205,10 +256,13 @@ export default function Reader() {
       });
       if(draftTiming && draftTiming.size>5_000_000) throw new Error('Файл меток слишком большой. Максимум 5 МБ.');
       const cues=draftTiming ? validateCues(JSON.parse(await draftTiming.text()),content.words,duration) : estimateCues(content.words,duration);
-      setDocument({title:draftTitle.trim() || content.blocks[0]?.text.slice(0,90) || 'Моя статья',text:draftText.trim(),cues,duration,position:0,audioName:draftAudio.name});
+      cancelSync();
+      const nextDocument: ReadingDocument = {title:draftTitle.trim() || content.blocks[0]?.text.slice(0,90) || 'Моя статья',text:draftText.trim(),cues,duration,position:0,audioName:draftAudio.name};
+      setDocument(nextDocument);
       restorePosition.current=0;setPosition(0);setBookmark(null);setAudioBlob(draftAudio);setExact(Boolean(draftTiming));setCanSave(true);setDialog('');setNotice('Материал открыт. Текст и аудио сохраняются в этом браузере.');
       try {localStorage.setItem('reader-position','0');localStorage.removeItem('reader-bookmark');} catch { /* Чтение доступно и без локального хранилища. */ }
       window.scrollTo({top:0,behavior:'instant'});
+      if (autoSync && !draftTiming) void startSync(nextDocument,draftAudio);
     } catch(cause) {setError(cause instanceof SyntaxError ? 'Не удалось прочитать метки. Проверьте формат JSON.' : cause instanceof Error ? cause.message : 'Не удалось открыть материал.');}
     finally {probe.removeAttribute('src');probe.load();URL.revokeObjectURL(url);setBusy(false);}
   }
@@ -218,7 +272,7 @@ export default function Reader() {
     if(file.size>5_000_000){setError('Файл меток слишком большой. Максимум 5 МБ.');return;}
     try {
       const cues=validateCues(JSON.parse(await file.text()),words,document.duration);
-      pause();setDocument({...document,cues});setExact(true);setDialog('');setNotice('Точные метки применены. Подсветка следует за аудио.');setError('');
+      cancelSync();pause();setDocument({...document,cues,alignment:undefined});setExact(true);setDialog('');setNotice('Точные метки применены. Подсветка следует за аудио.');setError('');
     } catch(cause){setError(cause instanceof SyntaxError ? 'Файл должен содержать метки в формате JSON.' : cause instanceof Error ? cause.message : 'Не удалось прочитать метки.');}
   }
 
@@ -236,7 +290,7 @@ export default function Reader() {
       <div className="article-meta"><span>{words.length} слов</span><span>·</span><span>{Math.max(1,Math.ceil(document.duration/60))} мин</span><span>·</span><span>Сохранено на устройстве</span></div>
       <div className="reader-callout"><span className="callout-icon"><Icon name="volume"/></span><div><strong>Читайте. Слушайте. Следуйте за словами.</strong><p>{audioUrl ? 'Нажмите на слово, чтобы перейти к нему в аудио.' : 'Озвучьте пример или добавьте текст и аудиофайл своей статьи.'}</p></div>{!audioUrl&&<button onClick={openImport} aria-label="Добавить свою статью"><Icon name="arrow"/></button>}</div>
       <button className="publication-cta" onClick={()=>{pause();setError('');setDialog('publish');}}>{audioUrl ? 'Скачать статью и аудио для личного архива' : 'Как сохранить статью и озвучку'}<Icon name="arrow" size={16}/></button>
-      <div className="reader-toolbar"><button className={follow?'follow-toggle enabled':'follow-toggle'} onClick={()=>setFollow(v=>!v)} aria-pressed={follow}><span className="toggle-track"><span/></span>Следить за текстом</button><button className="timing-button" onClick={()=>{setError('');setDialog('timing');}}>{exact ? '✓ Точные метки' : audioUrl ? '≈ Приблизительная разметка' : 'Озвучка браузера'} <span>ⓘ</span></button></div>
+      <div className="reader-toolbar"><button className={follow?'follow-toggle enabled':'follow-toggle'} onClick={()=>setFollow(v=>!v)} aria-pressed={follow}><span className="toggle-track"><span/></span>Следить за текстом</button><button className="timing-button" onClick={()=>{setError('');setDialog('timing');}}>{syncProgress ? 'Синхронизация…' : exact ? '✓ Точные метки' : document.alignment ? '✓ Автоматическая синхронизация' : audioUrl ? '≈ Приблизительная разметка' : 'Озвучка браузера'} <span>ⓘ</span></button></div>
       <article ref={article} className="reading-article" style={{fontSize:`${fontSize}px`}} aria-label="Текст статьи">
         {blocks.map((block,index)=>{
           const text=words.slice(block.first,block.first+block.count).map((word,offset)=>{
@@ -256,8 +310,9 @@ export default function Reader() {
       </div>
       {audioUrl&&<audio ref={audio} src={audioUrl} preload="metadata" onLoadedMetadata={()=>{if(audio.current){audio.current.currentTime=restorePosition.current;audio.current.playbackRate=rate;}}} onTimeUpdate={()=>setPosition(audio.current?.currentTime??0)} onPlay={()=>setPlaying(true)} onPause={()=>setPlaying(false)} onEnded={()=>setPlaying(false)} onError={()=>{setPlaying(false);setError('Не удалось воспроизвести аудио. Выберите поддерживаемый файл.');}}/>}
     </footer>
-    {notice&&<div className="toast" role="status">{notice}<button aria-label="Скрыть уведомление" onClick={()=>setNotice('')}><Icon name="close" size={16}/></button></div>}
-    {error&&!dialog&&<div className="toast error" role="alert">{error}<button aria-label="Закрыть ошибку" onClick={()=>setError('')}><Icon name="close" size={16}/></button></div>}
+    {syncProgress&&<div className="toast sync-toast" role="status"><span>{syncProgress.stage==='loading'?'Загрузка модели':syncProgress.stage==='decoding'?'Подготовка аудио':syncProgress.stage==='transcribing'?'Распознавание речи':syncProgress.stage==='refining'?'Уточнение стыков':'Сопоставление слов'} · {Math.round(Math.max(0,Math.min(1,syncProgress.progress))*100)}%</span><button onClick={()=>cancelSync(true)}>Отменить</button></div>}
+    {!syncProgress&&notice&&<div className="toast" role="status">{notice}<button aria-label="Скрыть уведомление" onClick={()=>setNotice('')}><Icon name="close" size={16}/></button></div>}
+    {!syncProgress&&error&&!dialog&&<div className="toast error" role="alert">{error}<button aria-label="Закрыть ошибку" onClick={()=>setError('')}><Icon name="close" size={16}/></button></div>}
     {dialog&&<Modal title={dialog==='publish'?'Сохранить материал':dialog==='import'?'Добавить материал':dialog==='settings'?'Настройки чтения':'Синхронизация слов'} closeDisabled={busy||capturing} onClose={()=>{if(!busy&&!capturing){setDialog('');setError('');}}}>
       {dialog==='publish'?<Publish document={document} audio={audioBlob} exact={exact} onImport={openImport}/>:dialog==='import'?<form className="import-form" onSubmit={e=>{e.preventDefault();void importDocument();}}>
         <p className="muted">Ваша статья и её озвучка. Файлы остаются на устройстве.</p>
@@ -269,10 +324,11 @@ export default function Reader() {
         <AudioCapture onCapture={file=>{setDraftAudio(file);setError('');}} onActiveChange={setCapturing}/>
         {draftAudio&&<p className="small-note selected-audio">К импорту: {draftAudio.name}</p>}
         <label className="file-label">Метки слов <span>Необязательно · JSON</span><input type="file" accept=".json,application/json" onChange={e=>setDraftTiming(e.target.files?.[0])}/></label>
-        <p className="small-note">Без меток время каждого слова рассчитывается приблизительно по длине текста. Заголовки тоже входят в озвучку.</p>
+        <label className="auto-sync-option"><input type="checkbox" checked={autoSync} onChange={e=>setAutoSync(e.target.checked)} disabled={Boolean(draftTiming)}/><span>Автоматически синхронизировать слова с записью</span></label>
+        <p className="small-note">При первом запуске браузер скачает модель около 200 МБ. Текст и запись остаются на устройстве. Заголовки тоже должны звучать в записи. При наличии JSON используются его метки.</p>
         {error&&<p className="form-error" role="alert">{error}</p>}
         <button className="primary-button" disabled={busy||capturing} type="submit">{busy?'Открываем материал…':capturing?'Завершите запись, чтобы продолжить':'Начать чтение'}<Icon name="arrow" size={18}/></button>
-      </form>:dialog==='settings'?<div className="settings-panel"><label>Размер текста <strong>{fontSize} px</strong><input type="range" min="16" max="30" value={fontSize} onChange={e=>setFontSize(Number(e.target.value))}/></label><button className="setting-row" onClick={()=>setFollow(v=>!v)}>Автопрокрутка <span>{follow?'Включена':'Выключена'}</span></button>{bookmark!==null&&<button className="setting-row" onClick={()=>{seek(bookmark);setDialog('');}}>Перейти к закладке <span>{formatTime(bookmark)}</span></button>}<p className="muted">Пробел — пауза. Стрелки ← и → — перемотка на 15 секунд. Нажмите на слово, чтобы перейти к нему.</p></div>:<div className="timing-panel"><p>{exact?'Подключены точные метки каждого слова.':audioUrl?'Сейчас используется приблизительная разметка по длине слов. Паузы и интонация могут смещать подсветку.':'Пример озвучивается голосом браузера. Точность выделения зависит от поддержки событий озвучки.'}</p><p>Для точного совпадения загрузите метки слов именно для этого текста и аудио. Время указывается в секундах, включая заголовки.</p><pre>{'[{"word":"Читать","start":0,"end":0.6},\n {"word":"в","start":0.6,"end":0.8}, …]'}</pre>{audioUrl?<label className="file-label">Загрузить метки JSON<input type="file" accept=".json,application/json" onChange={e=>void importTiming(e.target.files?.[0])}/></label>:<button className="primary-button" onClick={openImport}>Добавить текст и аудио</button>}{error&&<p className="form-error" role="alert">{error}</p>}</div>}
+      </form>:dialog==='settings'?<div className="settings-panel"><label>Размер текста <strong>{fontSize} px</strong><input type="range" min="16" max="30" value={fontSize} onChange={e=>setFontSize(Number(e.target.value))}/></label><button className="setting-row" onClick={()=>setFollow(v=>!v)}>Автопрокрутка <span>{follow?'Включена':'Выключена'}</span></button>{bookmark!==null&&<button className="setting-row" onClick={()=>{seek(bookmark);setDialog('');}}>Перейти к закладке <span>{formatTime(bookmark)}</span></button>}<p className="muted">Пробел — пауза. Стрелки ← и → — перемотка на 15 секунд. Нажмите на слово, чтобы перейти к нему.</p></div>:<div className="timing-panel"><p>{exact?'Подключены метки каждого слова из JSON.':document.alignment?`Автоматически сопоставлено ${document.alignment.matched} из ${document.alignment.total} слов. Для ${document.alignment.estimated} слов время рассчитано приблизительно. ${document.alignment.boundaryWarning?'Не удалось уточнить границы фрагментов. ':''}Проверьте совпадение на слух.`:audioUrl?'Сейчас используется приблизительная разметка по длине слов. Паузы и интонация могут смещать подсветку.':'Пример озвучивается голосом браузера. Точность выделения зависит от поддержки событий озвучки.'}</p>{audioBlob&&<><button className="primary-button" disabled={Boolean(syncProgress)} onClick={()=>{setDialog('');void startSync(document,audioBlob);}}>{syncProgress?'Синхронизация выполняется…':'Синхронизировать автоматически'}</button><p className="small-note">Речь распознаётся на устройстве. При первом запуске требуется скачать модель около 200 МБ; обработка может занять несколько минут.</p></>}<p>Также можно загрузить метки слов для этого текста и аудио. Время указывается в секундах, включая заголовки.</p><pre>{'[{"word":"Читать","start":0,"end":0.6},\n {"word":"в","start":0.6,"end":0.8}, …]'}</pre>{audioUrl?<label className="file-label">Загрузить метки JSON<input type="file" accept=".json,application/json" onChange={e=>void importTiming(e.target.files?.[0])}/></label>:<button className="primary-button" onClick={openImport}>Добавить текст и аудио</button>}{error&&<p className="form-error" role="alert">{error}</p>}</div>}
     </Modal>}
   </div>;
 }

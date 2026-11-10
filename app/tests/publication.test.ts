@@ -16,6 +16,9 @@ test('Экспорт включает текст, метки и переноси
   assert.equal((html.match(/<script>/gu) ?? []).length, 1);
   assert.doesNotMatch(html, /blob:|localhost|_next|indexedDB/u);
   assert.match(createPublication(example(), false), /Приблизительная подсветка/u);
+  const automatic = createPublication({ ...example(), alignment: { matched: 3, total: 3, estimated: 0 } }, false);
+  assert.match(automatic, /Автоматическая синхронизация: возможны неточности/u);
+  assert.doesNotMatch(automatic, /Точные метки слов/u);
   assert.throws(() => createPublication({ ...example(), cues: [] }, true));
 });
 

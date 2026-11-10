@@ -12,6 +12,8 @@
   "dependencies": {
     "@fix-webm-duration/fix": "1.0.1",
     "@mediabunny/mp3-encoder": "1.65.2",
+    "browser-whisper": "2.0.0",
+    "diff": "9.0.0",
     "mediabunny": "1.65.2",
     "next": "^16.0.0",
     "react": "^19.2.0",
