@@ -3,7 +3,7 @@ export interface SavedReading { document: ReadingDocument; audio?: Blob; exact: 
 // Прежнее имя базы сохраняет доступ к материалам после переименования в speechread.
 const DB_NAME = 'text-and-voice';
 
-function openDatabase(): Promise<IDBDatabase> {
+export function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve,reject)=> {
     const request = indexedDB.open(DB_NAME,1);
     request.onupgradeneeded = () => request.result.createObjectStore('reading');
@@ -25,15 +25,21 @@ export async function loadReading(): Promise<SavedReading | undefined> {
   });
 }
 
-export async function saveReading(value: SavedReading): Promise<void> {
-  const database = await openDatabase();
-  return new Promise((resolve,reject)=> {
-    const transaction = database.transaction('reading','readwrite');
-    transaction.objectStore('reading').put(value,'current');
-    transaction.oncomplete = () => {database.close();resolve();};
-    transaction.onerror = () => {database.close();reject(transaction.error);};
-    transaction.onabort = () => {database.close();reject(transaction.error);};
+let readingWrites: Promise<void> = Promise.resolve();
+
+export function saveReading(value: SavedReading): Promise<void> {
+  const operation=readingWrites.then(async()=>{
+    const database = await openDatabase();
+    return new Promise<void>((resolve,reject)=> {
+      const transaction = database.transaction('reading','readwrite');
+      transaction.objectStore('reading').put(value,'current');
+      transaction.oncomplete = () => {database.close();resolve();};
+      transaction.onerror = () => {database.close();reject(transaction.error);};
+      transaction.onabort = () => {database.close();reject(transaction.error);};
+    });
   });
+  readingWrites=operation.catch(()=>undefined);
+  return operation;
 }
 
 export async function saveCapturedAudio(file: File): Promise<void> {

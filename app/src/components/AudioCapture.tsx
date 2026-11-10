@@ -5,6 +5,7 @@ import { formatTime } from '../lib/sync';
 import { convertToMp3 } from '../lib/mp3';
 import { loadCapturedAudio, saveCapturedAudio } from '../lib/storage';
 import { downloadFile } from '../lib/download';
+import { createCaptureJournal, loadCaptureJournal, clearCaptureJournal, type CaptureJournal } from '../lib/capture-journal';
 
 export default function AudioCapture({ onCapture, onActiveChange }: {
   onCapture: (file: File) => void;
@@ -17,8 +18,12 @@ export default function AudioCapture({ onCapture, onActiveChange }: {
   const [download, setDownload] = useState<{ file: File; url: string }>();
   const [progress, setProgress] = useState(0);
   const [restored, setRestored] = useState(false);
+  const [unfinished, setUnfinished] = useState(false);
   const [savedMessage, setSavedMessage] = useState('');
   const current = useRef<AudioRecording | null>(null);
+  const journal = useRef<CaptureJournal | null>(null);
+  const recoveryId = useRef<string | null>(null);
+  const cancelledAttempts = useRef(new Set<number>());
   const conversion = useRef<AbortController | null>(null);
   const mounted = useRef(true);
   const generation = useRef(0);
@@ -28,10 +33,27 @@ export default function AudioCapture({ onCapture, onActiveChange }: {
     mounted.current = true;
     let live = true;
     const loadGeneration = generation.current;
-    loadCapturedAudio().then(saved=>{
-      if (live && mounted.current && generation.current === loadGeneration && saved) {setFile(saved);setRestored(true);}
-    }).catch(()=>{if(live&&mounted.current)setError('Не удалось восстановить последнюю запись из браузера.');});
-    return () => { live = false;mounted.current = false; generation.current++; current.current?.cancel(); conversion.current?.abort(); };
+    Promise.allSettled([loadCaptureJournal(), loadCapturedAudio()]).then(([pending, last]) => {
+      if (!live || !mounted.current || generation.current !== loadGeneration) return;
+      if (pending.status === 'fulfilled' && pending.value) {
+        setFile(pending.value.file); setSeconds(pending.value.elapsedMs / 1000); setRestored(true); setUnfinished(true);
+        recoveryId.current = pending.value.sessionId;
+      } else if (last.status === 'fulfilled' && last.value) { setFile(last.value); setRestored(true); }
+      if (pending.status === 'rejected' || last.status === 'rejected') setError('Не удалось восстановить часть записей из браузера. Сохраните доступный файл вручную.');
+    });
+    const flush = (): void => { current.current?.flush(); };
+    const hidden = (): void => { if (document.visibilityState === 'hidden') flush(); };
+    document.addEventListener('visibilitychange', hidden);
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('blur', flush);
+    return () => {
+      live = false; mounted.current = false; generation.current++;
+      document.removeEventListener('visibilitychange', hidden);
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('blur', flush);
+      // Размонтирование и перезагрузка сохраняют журнал; удаление разрешено только явной отменой.
+      current.current?.flush(); current.current?.stop(); conversion.current?.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -53,17 +75,33 @@ export default function AudioCapture({ onCapture, onActiveChange }: {
     let sourceSaved = false;
     setError('');setSavedMessage(''); setSeconds(0); setPhase('requesting'); onActiveChange(true);
     try {
-      const recording = await captureTabAudio(value => { if (mounted.current && attempt === generation.current) setSeconds(value); });
+      const activeJournal = createCaptureJournal();
+      journal.current = activeJournal;
+      const recording = await captureTabAudio(value => { if (mounted.current && attempt === generation.current) setSeconds(value); }, async (chunk, elapsedMs) => {
+        try { await activeJournal.append(chunk, elapsedMs); }
+        catch (cause) {
+          if (mounted.current && attempt === generation.current) setError('Не удалось сохранить промежуточную запись в браузере. Запись продолжается; после остановки скачайте файл вручную.');
+          throw cause;
+        }
+      });
       if (!mounted.current || attempt !== generation.current) {
-        recording.cancel(); await recording.result.catch(() => undefined); return;
+        if (cancelledAttempts.current.has(attempt)) recording.cancel(); else recording.stop();
+        await recording.result.catch(() => undefined);
+        if (cancelledAttempts.current.has(attempt)) await activeJournal.clear().catch(() => undefined);
+        return;
       }
       current.current = recording; setPhase('recording');
       const captured = await recording.result;
       if (!mounted.current || attempt !== generation.current) return;
-      setFile(captured.file);setRestored(false);onCapture(captured.file); sourceSaved = true;
+      setFile(captured.file);setRestored(false);setUnfinished(false);
       if(captured.warning)setError(captured.warning);
+      if (captured.partial) {
+        setRestored(true); setUnfinished(true); recoveryId.current = activeJournal.sessionId;
+        return;
+      }
+      onCapture(captured.file); sourceSaved = true;
       setPhase('finishing'); setProgress(0);
-      try {await saveCapturedAudio(captured.file);}
+      try { await saveCapturedAudio(captured.file); await activeJournal.clear(); recoveryId.current = null; }
       catch {if(mounted.current&&attempt===generation.current)setError('Не удалось сохранить исходник в браузере. Скачайте запись вручную.');}
       if (!mounted.current || attempt !== generation.current) return;
       const controller = new AbortController(); conversion.current = controller;
@@ -84,14 +122,36 @@ export default function AudioCapture({ onCapture, onActiveChange }: {
         ? 'Доступ к вкладке не предоставлен. Можно выбрать её повторно или загрузить готовый аудиофайл.'
         : `${cause instanceof Error ? cause.message : 'Не удалось записать звук вкладки.'}${sourceSaved ? ' Исходная запись WebM прикреплена и доступна для скачивания.' : ''}`);
     } finally {
+      cancelledAttempts.current.delete(attempt);
       if (mounted.current && attempt === generation.current) { current.current = null; conversion.current = null; setPhase('idle'); onActiveChange(false); }
     }
   }
 
   function cancel(): void {
-    generation.current++; current.current?.cancel(); current.current = null; conversion.current?.abort(); conversion.current = null;
+    cancelledAttempts.current.add(generation.current);
+    generation.current++;
+    const recording = current.current, activeJournal = journal.current;
+    recording?.cancel(); current.current = null; conversion.current?.abort(); conversion.current = null;
+    if (recording && activeJournal) {
+      void recording.result.catch(() => undefined).then(() => activeJournal.clear()).catch(() => {
+        if (mounted.current) setError('Не удалось удалить отменённую запись из браузера.');
+      });
+    }
     if(phase === 'finishing')setError('Подготовка MP3 отменена. Исходная запись WebM доступна для скачивания.');
     setPhase('idle'); onActiveChange(false);
+  }
+
+  async function attachRecovered(): Promise<void> {
+    if (!file || active) return;
+    const recoveredSession = recoveryId.current;
+    onCapture(file); setRestored(false); setUnfinished(false); setSavedMessage('Восстановленная запись прикреплена к статье.');
+    try {
+      await saveCapturedAudio(file);
+      if (recoveredSession) await clearCaptureJournal(recoveredSession);
+      if (recoveryId.current === recoveredSession) recoveryId.current = null;
+    } catch {
+      if (mounted.current) setError('Фрагмент прикреплён, но сохранить его в браузере не удалось. Скачайте файл вручную.');
+    }
   }
 
   return <section className="capture-panel" aria-label="Запись звука вкладки">
@@ -104,7 +164,7 @@ export default function AudioCapture({ onCapture, onActiveChange }: {
         <button type="button" className="capture-cancel" onClick={cancel}>{phase === 'finishing' ? 'Отменить подготовку MP3' : 'Отменить запись'}</button>
       </>}
     </div>
-    {download && <div className="capture-result"><p role="status">{restored?'Найдена последняя запись в браузере.':savedMessage || 'Запись прикреплена к статье.'}</p><audio controls src={download.url} preload="metadata" aria-label="Прослушать записанный звук"/>{restored&&<button type="button" className="upload-button" onClick={()=>{onCapture(download.file);setRestored(false);setSavedMessage('Последняя запись прикреплена к статье.');}}>Прикрепить последнюю запись</button>}<a className="upload-button" href={download.url} download={download.file.name}>{download.file.type === 'audio/mpeg' ? 'Скачать запись MP3' : 'Скачать исходник WebM'}</a></div>}
+    {download && <div className="capture-result"><p role="status">{restored ? unfinished ? 'Найдена незавершённая запись. Сохранённый фрагмент можно прослушать, прикрепить или скачать.' : 'Найдена последняя запись в браузере.' : savedMessage || 'Запись прикреплена к статье.'}</p><audio controls src={download.url} preload="metadata" aria-label="Прослушать записанный звук"/>{restored&&<button type="button" className="upload-button" disabled={active} onClick={() => void attachRecovered()}>{unfinished ? 'Прикрепить сохранённый фрагмент' : 'Прикрепить последнюю запись'}</button>}<a className="upload-button" href={download.url} download={download.file.name}>{download.file.type === 'audio/mpeg' ? 'Скачать запись MP3' : 'Скачать исходник WebM'}</a></div>}
     {error && <p className="form-error" role="alert">{error}</p>}
   </section>;
 }

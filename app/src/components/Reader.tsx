@@ -8,10 +8,11 @@ import AudioCapture from './AudioCapture';
 import SynchronizationPanel from './SynchronizationPanel';
 import { DEMO_TEXT, estimateCues, findActiveWord, formatTime, parseText, validateCues, type ReadingDocument, type WordCue } from '../lib/sync';
 import type { CloudSyncOptions } from '../lib/cloud-sync';
-import { loadReading, saveReading } from '../lib/storage';
+import { loadReading, saveReading, type SavedReading } from '../lib/storage';
 import type { SyncProgress } from '../lib/auto-sync';
 import { detectSilences, silenceEndAt, type AudioRange } from '../lib/silence';
 import { parseMaterialFiles } from '../lib/import-files';
+import { cacheEditorDraft, clearEditorDraft, loadEditorDraft, saveEditorDraft, type EditorDraft } from '../lib/editor-draft';
 
 const initialWords = parseText(DEMO_TEXT).words;
 const initialDuration = initialWords.length / 2.6;
@@ -23,10 +24,11 @@ export default function Reader() {
   const [playing, setPlaying] = useState(false);
   const [rate, setRate] = useState(1);
   const [fontSize, setFontSize] = useState(22);
-  const [follow, setFollow] = useState(true);
+  const [follow, setFollow] = useState(false);
   const [exact, setExact] = useState(false);
   const [ready, setReady] = useState(false);
   const [canSave, setCanSave] = useState(false);
+  const [readingSaved, setReadingSaved] = useState(false);
   const [audioUrl, setAudioUrl] = useState('');
   const [audioBlob, setAudioBlob] = useState<Blob>();
   const [dialog, setDialog] = useState<'import'|'settings'|'timing'|'publish'|''>('');
@@ -34,10 +36,16 @@ export default function Reader() {
   const [draftTitle, setDraftTitle] = useState('');
   const [draftAudio, setDraftAudio] = useState<File>();
   const [draftTiming, setDraftTiming] = useState<File>();
+  const [draftId, setDraftId] = useState('');
+  const [draftUsesCurrentAudio, setDraftUsesCurrentAudio] = useState(false);
+  const [draftAudioIdentity, setDraftAudioIdentity] = useState<string>();
+  const [draftReady, setDraftReady] = useState(false);
+  const [draftDirty, setDraftDirty] = useState(false);
+  const [draftSaved, setDraftSaved] = useState(false);
   const [autoSync, setAutoSync] = useState(true);
   const [dragging, setDragging] = useState(false);
   const [readingText, setReadingText] = useState(false);
-  const [playerCollapsed, setPlayerCollapsed] = useState(false);
+  const [playerCollapsed, setPlayerCollapsed] = useState(true);
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
   const [syncProvider, setSyncProvider] = useState<'local' | 'openai' | 'gemini'>('local');
   const [silences, setSilences] = useState<AudioRange[] | null>(null);
@@ -58,8 +66,25 @@ export default function Reader() {
   const syncController = useRef<AbortController | null>(null);
   const silenceController = useRef<AbortController | null>(null);
   const textImportGeneration = useRef(0);
+  const draftInitialized = useRef(false);
+  const draftTimestamp = useRef(0);
+  const latestDraft = useRef<EditorDraft | null>(null);
+  const draftMedia = useRef<{ id: string; audio?: File; timing?: File } | undefined>(undefined);
+  const pendingDraftMedia = useRef<{ id:string;audio?:File;timing?:File;promise:Promise<void> } | undefined>(undefined);
+  const draftSaveGeneration = useRef(0);
+  const readingSaveGeneration = useRef(0);
+  const latestReading = useRef<SavedReading | null>(null);
+  const currentAudioIdentity = audioBlob ? `${document.audioName??''}|${audioBlob.size}|${document.duration}` : '';
+  const useCurrentAudio = draftUsesCurrentAudio && draftAudioIdentity === currentAudioIdentity && Boolean(audioBlob);
+  const editorAudio = draftAudio ?? (useCurrentAudio ? audioBlob : undefined);
+  const editorAudioName = draftAudio?.name ?? (useCurrentAudio ? document.audioName : undefined);
+  const editorDraft = useMemo<EditorDraft>(() => {
+    draftTimestamp.current=Math.max(Date.now(),draftTimestamp.current+1);
+    return {id:draftId,title:draftTitle,text:draftText,autoSync,usesCurrentAudio:draftUsesCurrentAudio,audioIdentity:draftAudioIdentity,audioName:editorAudioName,updatedAt:draftTimestamp.current};
+  },[draftId,draftTitle,draftText,autoSync,draftUsesCurrentAudio,draftAudioIdentity,editorAudioName]);
+  latestDraft.current = draftDirty && draftId ? editorDraft : null;
   const {blocks, words} = useMemo(()=>parseText(document.text),[document.text]);
-  const active = findActiveWord(document.cues,position);
+  const active = playing && follow ? findActiveWord(document.cues,position) : -1;
   const headings = blocks.map((block,index)=>({block,index})).filter(({block})=>block.kind === 'heading');
   const audioPercent = document.duration ? Math.min(100, Math.round(position/document.duration*100)) : 0;
   const readAudioPosition = useCallback((): number => {
@@ -70,16 +95,21 @@ export default function Reader() {
     return player.currentTime;
   },[skipSilence,silences]);
 
+  function setReading(value: SavedReading): void {
+    latestReading.current=value;
+    setDocument(value.document);setAudioBlob(value.audio);setExact(value.exact);
+  }
+
   useEffect(()=> {
     if(window.innerWidth<=760) setFontSize(17);
     if(new URLSearchParams(window.location.search).get('publish')==='1') setDialog('publish');
     let cancelled = false;
     loadReading().then(saved=> {
       if (cancelled) return;
-      if (!saved) {setCanSave(true);return;}
+      if (!saved) {latestReading.current={document:initialDocument,exact:false};setCanSave(true);return;}
       const savedWords = parseText(saved.document.text).words;
       validateCues(saved.document.cues,savedWords,saved.document.duration);
-      setDocument(saved.document);
+      setReading(saved);
       let current = saved.document.position;
       let mark: string | null = null;
       try {
@@ -90,14 +120,82 @@ export default function Reader() {
       const restored = Math.min(saved.document.duration,Math.max(0,Number.isFinite(current) ? current : saved.document.position));
       restorePosition.current = restored;
       setPosition(restored);
-      setDraftText(saved.document.text);
-      setExact(saved.exact);
-      setAudioBlob(saved.audio);
       if (mark !== null && Number.isFinite(Number(mark))) setBookmark(Number(mark));
       setCanSave(true);
     }).catch(()=>{if (!cancelled) setNotice('Хранилище недоступно. Можно читать и слушать, но данные не сохранятся.');}).finally(()=>{if (!cancelled) setReady(true);});
     return ()=>{cancelled=true; window.speechSynthesis?.cancel();};
   },[]);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadEditorDraft().then(saved => {
+      if (cancelled) return;
+      if (saved) {
+        const value = saved.draft;
+        draftTimestamp.current=Math.max(draftTimestamp.current,value.updatedAt);
+        draftInitialized.current = true;
+        draftMedia.current = { id:value.id,audio:saved.audio,timing:saved.timing };
+        setDraftId(value.id);setDraftTitle(value.title);setDraftText(value.text);setAutoSync(value.autoSync);
+        setDraftUsesCurrentAudio(value.usesCurrentAudio);setDraftAudioIdentity(value.audioIdentity);
+        setDraftAudio(saved.audio);setDraftTiming(saved.timing);setDraftDirty(true);setDraftSaved(true);
+      }
+    }).catch(() => { if(!cancelled)setNotice('Не удалось восстановить черновик. Сохранённая статья остаётся доступной.'); })
+      .finally(() => { if(!cancelled)setDraftReady(true); });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!draftReady || !draftDirty || !editorDraft.id) return;
+    const attempt = ++draftSaveGeneration.current;
+    setDraftSaved(false);cacheEditorDraft(editorDraft);
+    const desired = {id:draftId,audio:draftAudio,timing:draftTiming};
+    const sameMedia = (value?: {id:string;audio?:File;timing?:File}): boolean => Boolean(value&&value.id===desired.id&&value.audio===desired.audio&&value.timing===desired.timing);
+    const mediaChanged = !sameMedia(draftMedia.current) || Boolean(pendingDraftMedia.current&&!sameMedia(pendingDraftMedia.current));
+    const persist = (): void => {
+      let pending = pendingDraftMedia.current;
+      let created = false;
+      if (pending ? !sameMedia(pending) : !sameMedia(draftMedia.current)) {
+        const promise=saveEditorDraft(editorDraft,{audio:draftAudio,timing:draftTiming});
+        pending={...desired,promise};pendingDraftMedia.current=pending;
+        created=true;
+        const operation=pending;
+        void promise.then(()=>{draftMedia.current=desired;}).catch(()=>undefined).finally(()=>{if(pendingDraftMedia.current===operation)pendingDraftMedia.current=undefined;});
+      }
+      const operation = pending&&sameMedia(pending) ? created?pending.promise:pending.promise.then(()=>saveEditorDraft(editorDraft)) : saveEditorDraft(editorDraft);
+      operation.then(() => {if(attempt===draftSaveGeneration.current&&sameMedia(draftMedia.current))setDraftSaved(true);})
+        .catch(() => {if(attempt===draftSaveGeneration.current)setNotice('Черновик не удалось полностью сохранить. Не закрывайте вкладку, скачайте аудио отдельно.');});
+    };
+    if (mediaChanged) {
+      persist();
+      return;
+    }
+    const timer = window.setTimeout(() => persist(),200);
+    return () => window.clearTimeout(timer);
+  }, [draftReady,draftDirty,editorDraft,draftId,draftAudio,draftTiming]);
+
+  useEffect(() => {
+    if (!ready || !draftReady || !draftDirty || !useCurrentAudio) return;
+    const content = draftText.trim();
+    const nextWords = parseText(content).words;
+    if (nextWords.length > 30_000 || new TextEncoder().encode(content).byteLength > 2_000_000) return;
+    const title = draftTitle.trim() || 'Без названия';
+    if (document.title === title && document.text === content) return;
+    const textChanged = document.text !== content;
+    if (textChanged) cancelSync();
+    setReading({document:{...document,title,text:content,position:positionRef.current,cues:textChanged?estimateCues(nextWords,document.duration):document.cues,alignment:textChanged?undefined:document.alignment},audio:audioBlob,exact:textChanged?false:exact});
+  }, [ready,draftReady,draftDirty,useCurrentAudio,draftTitle,draftText,document.title,document.text]);
+
+  useEffect(() => {
+    const flush = (): void => {
+      const value = latestDraft.current;
+      if (value) {cacheEditorDraft(value);void saveEditorDraft(value).catch(() => undefined);}
+      const reading = latestReading.current;
+      if (reading) void saveReading(reading).catch(() => undefined);
+    };
+    const hidden = (): void => {if(window.document.visibilityState==='hidden')flush();};
+    window.addEventListener('blur',flush);window.addEventListener('pagehide',flush);window.document.addEventListener('visibilitychange',hidden);
+    return () => {flush();window.removeEventListener('blur',flush);window.removeEventListener('pagehide',flush);window.document.removeEventListener('visibilitychange',hidden);};
+  }, []);
 
   useEffect(()=> {
     if (!audioBlob) {setAudioUrl('');return;}
@@ -108,13 +206,21 @@ export default function Reader() {
 
   useEffect(()=> {
     positionRef.current = position;
+    if(latestReading.current)latestReading.current={...latestReading.current,document:{...latestReading.current.document,position}};
     if (!ready || !canSave) return;
     try {localStorage.setItem('reader-position',String(position));} catch { /* Хранилище может быть отключено в приватном режиме. */ }
   },[position,ready,canSave]);
 
   useEffect(()=> {
     if (!ready || !canSave) return;
-    saveReading({document:{...document,position:positionRef.current},audio:audioBlob,exact}).catch(()=>setNotice('Не удалось сохранить материал. Возможно, закончилось место в браузере.'));
+    const attempt = ++readingSaveGeneration.current;
+    setReadingSaved(false);
+    const timer=window.setTimeout(()=>{
+      saveReading({document:{...document,position:positionRef.current},audio:audioBlob,exact})
+        .then(()=>{if(attempt===readingSaveGeneration.current)setReadingSaved(true);})
+        .catch(()=>setNotice('Не удалось сохранить материал. Возможно, закончилось место в браузере. Черновик хранится отдельно.'));
+    },200);
+    return()=>window.clearTimeout(timer);
   },[document,audioBlob,exact,ready,canSave]);
 
   useEffect(()=> { if (audio.current) audio.current.playbackRate = rate; },[rate,audioUrl]);
@@ -203,6 +309,11 @@ export default function Reader() {
     } else speak(position>=document.duration ? 0 : position);
   }
 
+  async function listen(): Promise<void> {
+    setPlayerCollapsed(false);
+    if (!playing) await togglePlayback();
+  }
+
   function seek(time: number): void {
     const next = Math.min(document.duration,Math.max(0,time));
     setPosition(next);
@@ -213,7 +324,7 @@ export default function Reader() {
   useEffect(()=> {
     const key = (event: KeyboardEvent) => {
       const element=event.target as HTMLElement;
-      if(!audioUrl || dialog || element.closest('input,textarea,select,button,a,[role="button"]')) return;
+      if(!audioUrl || dialog || (playerCollapsed&&!playing) || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.repeat || element.closest('input,textarea,select,button,a,summary,[contenteditable="true"],[role="textbox"],[role="button"]')) return;
       if(event.code==='Space'){event.preventDefault();void togglePlayback();}
       if(event.code==='ArrowLeft'){event.preventDefault();seek(positionRef.current-15);}
       if(event.code==='ArrowRight'){event.preventDefault();seek(positionRef.current+15);}
@@ -223,8 +334,21 @@ export default function Reader() {
   });
 
   function openImport(): void {
+    if (!ready || !draftReady) {setNotice('Восстанавливаем сохранённый материал. Откройте форму через мгновение.');return;}
     textImportGeneration.current++;
-    pause();setReadingText(false);setDraftText(audioBlob?document.text:'');setDraftTitle(audioBlob?document.title:'');setDraftAudio(undefined);setDraftTiming(undefined);setDragging(false);setError('');setDialog('import');
+    if (!draftInitialized.current) {
+      draftInitialized.current = true;setDraftId(crypto.randomUUID());setDraftDirty(true);
+      setDraftText(audioBlob?document.text:'');setDraftTitle(audioBlob?document.title:'');setDraftAudio(undefined);setDraftTiming(undefined);
+      setDraftUsesCurrentAudio(Boolean(audioBlob));setDraftAudioIdentity(audioBlob?currentAudioIdentity:undefined);setAutoSync(!audioBlob);
+    }
+    pause();setReadingText(false);setDragging(false);setError('');setDialog('import');
+  }
+
+  function closeEditor(): void {
+    if (busy) return;
+    const value = latestDraft.current;
+    if (value) {cacheEditorDraft(value);void saveEditorDraft(value).catch(() => undefined);}
+    textImportGeneration.current++;setReadingText(false);setDialog('');setError('');
   }
 
   async function toggleSilence(): Promise<void> {
@@ -262,8 +386,9 @@ export default function Reader() {
         ? await (await import('../lib/cloud-sync')).synchronizeCloudAudio(target,source,options,controller.signal,updateProgress)
         : await (await import('../lib/auto-sync')).synchronizeAudio(target,source,controller.signal,updateProgress);
       if (syncController.current !== controller || controller.signal.aborted) return;
-      setDocument(current=>current === target ? {...current,cues:result.cues,alignment:{matched:result.matched,total:result.total,estimated:result.estimated,boundaryWarning:result.boundaryWarning,source:options?.provider??'local'}} : current);
-      setExact(false);
+      const reading=latestReading.current;
+      if(!reading||reading.audio!==source||reading.document.text!==target.text||reading.document.duration!==target.duration){setNotice('Материал изменился. Полученные метки не применены к другой записи или тексту.');return;}
+      setReading({...reading,document:{...reading.document,cues:result.cues,alignment:{matched:result.matched,total:result.total,estimated:result.estimated,boundaryWarning:result.boundaryWarning,source:options?.provider??'local'}},exact:false});
       setNotice(options?.provider==='gemini' ? 'Метки Gemini применены. Время слов оценено моделью; проверьте совпадение на слух.' : `Синхронизация завершена: совпало ${result.matched} из ${result.total} слов${result.estimated ? `, для ${result.estimated} время определено приблизительно` : ''}. ${result.boundaryWarning ? 'Не удалось уточнить границы фрагментов. ' : ''}Проверьте результат на слух.`);
     } catch (cause) {
       if (syncController.current !== controller || controller.signal.aborted) return;
@@ -280,11 +405,11 @@ export default function Reader() {
     try {
       const selected = parseMaterialFiles(files);
       if (selected.audio && capturing) throw new Error('Завершите запись вкладки перед заменой аудио. Текст можно добавить сейчас.');
-      if (selected.audio) setDraftAudio(selected.audio);
+      if (selected.audio) {setDraftAudio(selected.audio);setDraftUsesCurrentAudio(false);}
       setDraftTiming(undefined);setError('');
       if (selected.text) {
         attempt = ++textImportGeneration.current;
-        setReadingText(true);setDraftTitle(selected.text.name.replace(/\.[^.]+$/u,''));
+        setReadingText(true);setDraftTitle(selected.text.name.replace(/\.[^.]+$/u,'').slice(0,150));
         const text = await selected.text.text();
         if (attempt === textImportGeneration.current) setDraftText(text);
       }
@@ -300,33 +425,43 @@ export default function Reader() {
     const content = parseText(draftText);
     if(!content.words.length){setError('Добавьте текст статьи.');return;}
     if(content.words.length>30_000){setError('Для этой версии выберите статью до 30 000 слов.');return;}
-    if(!draftAudio){setError('Выберите аудиофайл с озвучкой статьи.');return;}
-    if(draftAudio.size>150_000_000){setError('Выберите аудиофайл меньше 150 МБ.');return;}
+    const source = editorAudio;
+    if(!source){setError('Выберите аудиофайл с озвучкой статьи. Текст черновика сохраняется отдельно.');return;}
+    if(source.size>150_000_000){setError('Выберите аудиофайл меньше 150 МБ.');return;}
     setBusy(true);setError('');
-    const url=URL.createObjectURL(draftAudio);
+    const url=URL.createObjectURL(source);
     const probe=new Audio();
     try {
-      const duration=await new Promise<number>((resolve,reject)=>{
+      const sameAudio = source === audioBlob;
+      const duration=sameAudio ? document.duration : await new Promise<number>((resolve,reject)=>{
         const timeout=window.setTimeout(()=>reject(new Error('Не удалось определить длительность аудио.')),12000);
         probe.onloadedmetadata=()=>{clearTimeout(timeout);Number.isFinite(probe.duration)&&probe.duration>0 ? resolve(probe.duration):reject(new Error('Неподдерживаемый аудиофайл.'));};
         probe.onerror=()=>{clearTimeout(timeout);reject(new Error('Этот аудиофайл не поддерживается. Попробуйте MP3 или WAV.'));};
         probe.src=url;
       });
       if(draftTiming && draftTiming.size>5_000_000) throw new Error('Файл меток слишком большой. Максимум 5 МБ.');
-      const cues=draftTiming ? validateCues(JSON.parse(await draftTiming.text()),content.words,duration) : estimateCues(content.words,duration);
+      const keepCues = sameAudio && draftText.trim() === document.text.trim() && !draftTiming;
+      const cues=draftTiming ? validateCues(JSON.parse(await draftTiming.text()),content.words,duration) : keepCues ? document.cues : estimateCues(content.words,duration);
+      const nextExact = keepCues ? exact : Boolean(draftTiming);
+      const nextPosition = sameAudio ? positionRef.current : 0;
+      const nextDocument: ReadingDocument = {title:draftTitle.trim() || content.blocks[0]?.text.slice(0,90) || 'Моя статья',text:draftText.trim(),cues,duration,position:nextPosition,audioName:editorAudioName,alignment:keepCues?document.alignment:undefined};
       cancelSync();
-      const nextDocument: ReadingDocument = {title:draftTitle.trim() || content.blocks[0]?.text.slice(0,90) || 'Моя статья',text:draftText.trim(),cues,duration,position:0,audioName:draftAudio.name};
-      setDocument(nextDocument);
-      restorePosition.current=0;setPosition(0);setBookmark(null);setAudioBlob(draftAudio);setPlayerCollapsed(false);setExact(Boolean(draftTiming));setCanSave(true);setDialog('');setNotice('Материал открыт. Текст и аудио сохраняются в этом браузере.');
-      try {localStorage.setItem('reader-position','0');localStorage.removeItem('reader-bookmark');} catch { /* Чтение доступно и без локального хранилища. */ }
+      restorePosition.current=nextPosition;setPosition(nextPosition);
+      setReading({document:nextDocument,audio:source,exact:nextExact});
+      await saveReading({document:nextDocument,audio:source,exact:nextExact});
+      if(!sameAudio)setBookmark(null);
+      setPlayerCollapsed(true);setCanSave(true);setDialog('');setNotice('Статья и аудио сохранены в этом браузере.');
+      latestDraft.current=null;draftInitialized.current=false;setDraftDirty(false);draftSaveGeneration.current++;
+      await clearEditorDraft(draftId).catch(()=>setNotice('Статья сохранена. Резервный черновик пока остался в браузере.'));
+      try {localStorage.setItem('reader-position',String(nextPosition));if(!sameAudio)localStorage.removeItem('reader-bookmark');} catch { /* Чтение доступно и без локального хранилища. */ }
       window.scrollTo({top:0,behavior:'instant'});
-      if (autoSync && !draftTiming) void startSync(nextDocument,draftAudio);
+      if (autoSync && !draftTiming) void startSync(nextDocument,source);
     } catch(cause) {setError(cause instanceof SyntaxError ? 'Не удалось прочитать метки. Проверьте формат JSON.' : cause instanceof Error ? cause.message : 'Не удалось открыть материал.');}
     finally {probe.removeAttribute('src');probe.load();URL.revokeObjectURL(url);setBusy(false);}
   }
 
   function applyTiming(cues: WordCue[]): void {
-    cancelSync();pause();setDocument({...document,cues,alignment:undefined});setExact(true);setDialog('');setNotice('Метки JSON применены. Проверьте совпадение со звуком.');setError('');
+    cancelSync();pause();setReading({document:{...document,cues,position:positionRef.current,alignment:undefined},audio:audioBlob,exact:true});setDialog('');setNotice('Метки JSON применены. Проверьте совпадение со звуком.');setError('');
   }
 
   function addBookmark(): void {
@@ -334,14 +469,14 @@ export default function Reader() {
     try {localStorage.setItem('reader-bookmark',String(position));setNotice(`Закладка сохранена: ${formatTime(position)}.`);} catch {setNotice('Закладка доступна до закрытия страницы.');}
   }
 
-  return <div className={`reader-app${!audioUrl ? ' without-audio' : playerCollapsed ? ' player-collapsed' : ''}`}>
-    <header className="reader-topbar"><Link href="/" className="reader-brand" aria-label="speechread — главная"><Icon name="book" size={24}/><span>speechread</span></Link><div className="reader-top-actions"><button className="upload-button publish-button" onClick={()=>{pause();setError('');setDialog('publish');}} aria-label="Сохранить материал"><Icon name="arrow" size={17}/><span>Сохранить</span></button><button className="upload-button" onClick={openImport} aria-label="Добавить материал"><Icon name="upload" size={17}/><span>Добавить материал</span></button></div></header>
+  return <div className={`reader-app${!audioUrl ? ' without-audio' : playerCollapsed ? playing?' player-collapsed':' reading-only' : ''}`}>
+    <header className="reader-topbar"><Link href="/" className="reader-brand" aria-label="speechread — главная"><Icon name="book" size={24}/><span>speechread</span></Link><div className="reader-top-actions"><button className="upload-button publish-button" onClick={()=>{pause();setError('');setDialog('publish');}} aria-label="Сохранить материал"><Icon name="arrow" size={17}/><span>Сохранить</span></button><button className="upload-button" onClick={openImport} disabled={!ready||!draftReady} aria-label={audioBlob?'Изменить статью':'Добавить материал'}><Icon name="upload" size={17}/><span>{audioBlob?'Изменить статью':'Добавить материал'}</span></button></div></header>
     <nav className="reading-nav" aria-label="Разделы статьи"><span className="reading-percent" title="Прогресс чтения">{readPercent}%</span><div className="section-links">{headings.map(({block,index})=><a href={`#section-${index}`} key={index} className={section===index?'is-active':''} onClick={()=>setFollow(false)}>{block.text}</a>)}</div><div className="reading-line"><span style={{width:`${readPercent}%`}}/></div></nav>
     <main className="reader-main">
       <div className="article-eyebrow"><span className="live-dot"/>{audioUrl ? 'ВАША СТАТЬЯ' : 'ПОПРОБУЙТЕ ЧИТАЛКУ'}<span>ТЕКСТ + АУДИО</span></div>
       <div className="article-title-row"><h1>{document.title}</h1><button className="icon-button" onClick={()=>setDialog('settings')} aria-label="Настройки чтения"><Icon name="settings"/></button></div>
-      <div className="article-meta"><span>{words.length} слов</span><span>·</span><span>{Math.max(1,Math.ceil(document.duration/60))} мин</span><span>·</span><span>Сохранено на устройстве</span></div>
-      <div className="reader-callout"><span className="callout-icon"><Icon name="volume"/></span><div><strong>Читайте. Слушайте. Следуйте за словами.</strong><p>{audioUrl ? 'Нажмите на слово, чтобы перейти к нему в аудио.' : 'Добавьте текст и аудиофайл своей статьи или послушайте пример.'}</p>{!audioUrl&&<button className="text-action demo-speech-button" onClick={()=>void togglePlayback()} disabled={!ready}>{playing?'Остановить пример':'Озвучить пример'}</button>}</div>{!audioUrl&&<button onClick={openImport} aria-label="Добавить свою статью"><Icon name="arrow"/></button>}</div>
+      <div className="article-meta"><span>{words.length} слов</span><span>·</span><span>{Math.max(1,Math.ceil(document.duration/60))} мин</span><span>·</span><span>{readingSaved?'Автоматически сохранено на устройстве':'Автоматически сохраняем…'}</span></div>
+      <div className="reader-callout"><span className="callout-icon"><Icon name="volume"/></span><div><strong>Читайте. Слушайте. Следуйте за словами.</strong><p>{audioUrl ? 'Читайте без плеера или включите аудио. Слежение за текстом включается отдельно.' : 'Добавьте текст и аудиофайл своей статьи или послушайте пример.'}</p>{audioUrl?<div className="listening-actions"><button className="upload-button" aria-controls="audio-player-controls" aria-expanded={!playerCollapsed} onClick={()=>void listen()}>{playing?'Открыть плеер':'Слушать'}</button><button className="text-action" onClick={()=>{setFollow(true);void listen();}}>Слушать и следить</button></div>:<button className="text-action demo-speech-button" onClick={()=>void togglePlayback()} disabled={!ready}>{playing?'Остановить пример':'Озвучить пример'}</button>}</div>{!audioUrl&&<button onClick={openImport} aria-label="Добавить свою статью"><Icon name="arrow"/></button>}</div>
       <button className="publication-cta" onClick={()=>{pause();setError('');setDialog('publish');}}>{audioUrl ? 'Скачать умную статью или аудио' : 'Как сохранить статью и озвучку'}<Icon name="arrow" size={16}/></button>
       <div className="reader-toolbar"><button className={follow?'follow-toggle enabled':'follow-toggle'} onClick={()=>setFollow(v=>!v)} aria-pressed={follow}><span className="toggle-track"><span/></span>Следить за текстом</button>{audioBlob&&<button className={skipSilence?'follow-toggle enabled':'follow-toggle'} onClick={()=>void toggleSilence()} disabled={silenceBusy} aria-pressed={skipSilence}><span className="toggle-track"><span/></span>{silenceBusy?'Поиск пауз…':'Пропускать паузы'}</button>}<button className="timing-button" aria-label="Способы синхронизации" onClick={()=>{setError('');setDialog('timing');}}>Синхронизация слов <span>ⓘ</span><small>{syncProgress ? 'Выполняется…' : exact ? '✓ Метки из JSON' : document.alignment?.source==='gemini' ? 'Оценка Gemini' : document.alignment?.source==='openai' ? '✓ OpenAI' : document.alignment ? '✓ Встроенный способ' : audioUrl ? '≈ Пока приблизительно' : 'Выбрать способ'}</small></button></div>
       <article ref={article} className="reading-article" style={{fontSize:`${fontSize}px`}} aria-label="Текст статьи">
@@ -362,36 +497,41 @@ export default function Reader() {
         <div className="player-timeline"><span>{formatTime(position)}</span><input aria-label="Позиция аудио" type="range" min="0" max={document.duration} step="0.05" value={position} onChange={e=>seek(Number(e.target.value))} style={{'--progress':`${audioPercent}%`} as React.CSSProperties}/><span>{formatTime(document.duration)}</span><span className="audio-percent">{audioPercent}%</span></div>
       </div>
     </footer>}
-    {audioUrl&&playerCollapsed&&<div className="audio-mini-player" role="group" aria-label="Свёрнутый плеер"><button className="icon-button" aria-label={playing?'Пауза':'Воспроизвести'} onClick={()=>void togglePlayback()}><Icon name={playing?'pause':'play'} size={18}/></button><button className="show-player" onClick={()=>setPlayerCollapsed(false)} aria-controls="audio-player-controls" aria-expanded="false">Показать плеер <span>{formatTime(position)}</span></button></div>}
+    {audioUrl&&playerCollapsed&&playing&&<div className="audio-mini-player" role="group" aria-label="Свёрнутый плеер"><button className="icon-button" aria-label="Пауза" onClick={()=>void togglePlayback()}><Icon name="pause" size={18}/></button><button className="show-player" onClick={()=>setPlayerCollapsed(false)} aria-controls="audio-player-controls" aria-expanded="false">Показать плеер <span>{formatTime(position)}</span></button></div>}
     {audioUrl&&<audio ref={audio} src={audioUrl} preload="metadata" onLoadedMetadata={()=>{if(audio.current){audio.current.currentTime=restorePosition.current;audio.current.playbackRate=rate;}}} onTimeUpdate={()=>setPosition(readAudioPosition())} onPlay={()=>setPlaying(true)} onPause={()=>setPlaying(false)} onEnded={()=>setPlaying(false)} onError={()=>{setPlaying(false);setError('Не удалось воспроизвести аудио. Выберите поддерживаемый файл.');}}/>}
     {syncProgress&&<div className="toast sync-toast" role="status"><span>{syncProvider!=='local'?`${syncProvider==='openai'?'OpenAI':'Gemini'} · Распознавание и проверка меток…`:<>{syncProgress.stage==='loading'?'Загрузка модели':syncProgress.stage==='decoding'?'Подготовка аудио':syncProgress.stage==='transcribing'?'Распознавание речи':syncProgress.stage==='refining'?'Уточнение стыков':'Сопоставление слов'} · {Math.round(Math.max(0,Math.min(1,syncProgress.progress))*100)}%</>}</span><button onClick={()=>cancelSync(true)}>Отменить</button></div>}
     {!syncProgress&&notice&&<div className="toast" role="status">{notice}<button aria-label="Скрыть уведомление" onClick={()=>setNotice('')}><Icon name="close" size={16}/></button></div>}
     {!syncProgress&&error&&!dialog&&<div className="toast error" role="alert">{error}<button aria-label="Закрыть ошибку" onClick={()=>setError('')}><Icon name="close" size={16}/></button></div>}
-    {dialog&&<Modal title={dialog==='publish'?'Сохранить материал':dialog==='import'?'Добавить материал':dialog==='settings'?'Настройки чтения':'Синхронизация слов'} closeDisabled={busy||capturing} onClose={()=>{if(!busy&&!capturing){textImportGeneration.current++;setReadingText(false);setDialog('');setError('');}}}>
-      {dialog==='publish'?<Publish document={document} audio={audioBlob} exact={exact} syncing={Boolean(syncProgress)} silences={silences} onSilences={setSilences} onImport={openImport}/>:dialog==='import'?<form className={`import-form${dragging?' is-dragging':''}`} onSubmit={e=>{e.preventDefault();void importDocument();}}
+    {capturing&&dialog!=='import'&&<div className="capture-status-bar" role="status">Запись вкладки продолжается <button className="upload-button" onClick={()=>setDialog('import')}>Открыть запись</button></div>}
+    <Modal title={useCurrentAudio?'Изменить статью':'Добавить материал'} open={dialog==='import'} dismissOnBackdrop={false} closeDisabled={busy} onClose={closeEditor}
+      footer={<button className="primary-button" form="material-editor-form" disabled={busy||capturing||readingText} type="submit">{busy?'Сохраняем статью…':capturing?'Завершите запись':readingText?'Читаем текст…':useCurrentAudio?'Готово':'Создать статью'}<Icon name="arrow" size={18}/></button>}>
+      <form id="material-editor-form" className={`import-form${dragging?' is-dragging':''}`} onSubmit={e=>{e.preventDefault();void importDocument();}}
         onDragOver={event=>{if(event.dataTransfer.types.includes('Files')){event.preventDefault();event.dataTransfer.dropEffect='copy';setDragging(true);}}}
         onDragLeave={event=>{if(!event.currentTarget.contains(event.relatedTarget as Node | null))setDragging(false);}}
         onDrop={event=>{event.preventDefault();setDragging(false);void addMaterialFiles(Array.from(event.dataTransfer.files));}}>
         <p className="muted">Добавьте текст и звук в любом порядке. Файлы можно выбрать или перетащить сюда — по одному или вместе.</p>
+        <p className="small-note draft-status" role="status">{useCurrentAudio?'Текст и название статьи меняются сразу. ':''}{draftSaved?'Изменения автоматически сохранены в этом браузере.':'Автоматически сохраняем изменения…'} Закрытие окна не удаляет введённый текст.</p>
         <div className="file-drop" role="group" aria-label="Аудиофайл">
           <label className="file-label" htmlFor="material-audio">Аудиофайл <span>Перетащите MP3, WAV, M4A, OGG, WebM или WEBA · до 150 МБ</span></label>
           <input id="material-audio" type="file" aria-label="Выбрать аудиофайл" accept="audio/*,.m4a,.webm,.weba,.mp4" onChange={event=>{void addMaterialFiles(Array.from(event.target.files??[]));event.target.value='';}} disabled={busy||capturing}/>
-          {draftAudio&&<p className="small-note selected-audio" role="status">Аудио: {draftAudio.name}</p>}
+          {editorAudio&&<p className="small-note selected-audio" role="status">Аудио: {editorAudioName || 'запись'}{useCurrentAudio?' · текущая запись сохранится':''}</p>}
         </div>
-        <AudioCapture onCapture={file=>{setDraftAudio(file);setDraftTiming(undefined);setError('');}} onActiveChange={setCapturing}/>
-        <label>Название<input value={draftTitle} onChange={e=>setDraftTitle(e.target.value)} placeholder="Название статьи" maxLength={150}/></label>
+        <AudioCapture onCapture={file=>{setDraftAudio(file);setDraftUsesCurrentAudio(false);setDraftTiming(undefined);setError('');}} onActiveChange={setCapturing}/>
+        <label>Название<input value={draftTitle} onChange={e=>setDraftTitle(e.target.value)} placeholder="Название статьи" maxLength={150} readOnly={busy}/></label>
         <div className="file-drop" role="group" aria-label="Текстовый файл">
           <label className="file-label" htmlFor="material-text">Текстовый файл <span>Перетащите TXT или Markdown · до 2 МБ</span></label>
           <input id="material-text" type="file" aria-label="Выбрать текстовый файл" accept=".txt,.md,.markdown,text/plain,text/markdown" onChange={event=>{void addMaterialFiles(Array.from(event.target.files??[]));event.target.value='';}} disabled={busy}/>
         </div>
-        <label>Текст статьи<textarea aria-label="Текст статьи" value={draftText} onChange={e=>{textImportGeneration.current++;setReadingText(false);setDraftText(e.target.value);setDraftTiming(undefined);}} rows={5} placeholder="Вставьте текст. Начните заголовок с #, чтобы добавить раздел в оглавление." required/></label>
+        <label>Текст статьи<textarea aria-label="Текст статьи" value={draftText} onChange={e=>{textImportGeneration.current++;setReadingText(false);setDraftText(e.target.value);setDraftTiming(undefined);}} rows={5} placeholder="Вставьте текст. Начните заголовок с #, чтобы добавить раздел в оглавление." required readOnly={busy}/></label>
         <label className="auto-sync-option"><input type="checkbox" checked={autoSync} onChange={e=>setAutoSync(e.target.checked)} disabled={Boolean(draftTiming)}/><span>Автоматически синхронизировать слова с записью в браузере, без ключа</span></label>
         <p className="small-note">При первом запуске скачивается модель примерно 200 МБ. Она распознаёт запись на вашем устройстве, затем сопоставляет слова с текстом. Текст и аудио остаются в браузере. Заголовки должны звучать в записи.</p>
         <details><summary>Какие ещё есть способы синхронизации?</summary><p className="small-note">После создания статьи нажмите «Синхронизация слов» над текстом. Там доступны встроенный способ, OpenAI API, Gemini API, вставка готового JSON и промпты для другого чата. API использует ваш ключ и отправляет аудио выбранному сервису. Для быстрого открытия статьи можно отключить обработку сейчас и выбрать способ позже.</p></details>
         <details><summary>Есть готовые метки слов?</summary><label className="file-label">Метки слов <span>Необязательно · JSON</span><input type="file" accept=".json,application/json" onChange={e=>setDraftTiming(e.target.files?.[0])}/></label>{draftTiming&&<p className="small-note">Выбрано: {draftTiming.name}</p>}</details>
         {error&&<p className="form-error" role="alert">{error}</p>}
-        <div className="import-actions"><button className="primary-button" disabled={busy||capturing||readingText} type="submit">{busy?'Открываем материал…':capturing?'Завершите запись':readingText?'Читаем текст…':'Создать статью'}<Icon name="arrow" size={18}/></button></div>
-      </form>:dialog==='settings'?<div className="settings-panel"><label>Размер текста <strong>{fontSize} px</strong><input type="range" min="16" max="30" value={fontSize} onChange={e=>setFontSize(Number(e.target.value))}/></label><button className="setting-row" onClick={()=>setFollow(v=>!v)}>Автопрокрутка <span>{follow?'Включена':'Выключена'}</span></button>{bookmark!==null&&<button className="setting-row" onClick={()=>{seek(bookmark);setDialog('');}}>Перейти к закладке <span>{formatTime(bookmark)}</span></button>}<p className="muted">Пробел — пауза. Стрелки ← и → — перемотка на 15 секунд. Нажмите на слово, чтобы перейти к нему.</p></div>:<SynchronizationPanel document={document} exact={exact} hasAudio={Boolean(audioBlob)} syncing={Boolean(syncProgress)} onRun={options=>{if(audioBlob){setDialog('');void startSync(document,audioBlob,options);}}} onApply={applyTiming} onAddMaterial={openImport}/>}
+      </form>
+    </Modal>
+    {dialog&&dialog!=='import'&&<Modal title={dialog==='publish'?'Сохранить материал':dialog==='settings'?'Настройки чтения':'Синхронизация слов'} onClose={()=>{setDialog('');setError('');}}>
+      {dialog==='publish'?<Publish document={document} audio={audioBlob} exact={exact} syncing={Boolean(syncProgress)} silences={silences} onSilences={setSilences} onImport={openImport}/>:dialog==='settings'?<div className="settings-panel"><label>Размер текста <strong>{fontSize} px</strong><input type="range" min="16" max="30" value={fontSize} onChange={e=>setFontSize(Number(e.target.value))}/></label><button className="setting-row" onClick={()=>setFollow(v=>!v)}>Автопрокрутка <span>{follow?'Включена':'Выключена'}</span></button>{bookmark!==null&&<button className="setting-row" onClick={()=>{seek(bookmark);setDialog('');}}>Перейти к закладке <span>{formatTime(bookmark)}</span></button>}<p className="muted">Пробел — пауза. Стрелки ← и → — перемотка на 15 секунд. Нажмите на слово, чтобы перейти к нему.</p></div>:<SynchronizationPanel document={document} exact={exact} hasAudio={Boolean(audioBlob)} syncing={Boolean(syncProgress)} onRun={options=>{if(audioBlob){setDialog('');void startSync(document,audioBlob,options);}}} onApply={applyTiming} onAddMaterial={openImport}/>}
     </Modal>}
   </div>;
 }
